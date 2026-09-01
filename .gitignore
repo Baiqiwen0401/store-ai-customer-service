@@ -16,5 +16,6 @@ rendered/
 *.sqlite3
 *.db
 runtime/
+ui-final-*.png
 *.tmp
 *.bak
