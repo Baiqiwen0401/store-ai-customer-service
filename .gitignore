@@ -15,5 +15,6 @@ rendered/
 .ruff_cache/
 *.sqlite3
 *.db
+runtime/
 *.tmp
 *.bak

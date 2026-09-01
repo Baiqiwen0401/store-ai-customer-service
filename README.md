@@ -9,6 +9,31 @@
 - 首期入口：网页客服；企业微信接入预留
 - 核心能力：门店知识库、客户长期记忆、标准问答、预约意向、人工接管、店主纠错闭环
 
+当前实现是本机可运行 MVP：默认监听 `127.0.0.1:8000`，使用 SQLite 保存数据。未配置模型密钥时仍可使用内置知识检索和安全规则；配置 OpenAI-compatible 环境变量后启用大模型回答。
+
+## 本地启动
+
+```powershell
+# 可选：配置中转站模型，不要把真实密钥写入文件或提交 Git
+$env:LLM_API_KEY = "你的模型密钥"
+$env:LLM_BASE_URL = "https://new.tianluo.ccwu.cc/v1"
+$env:LLM_MODEL = "gpt-5.6-sol"
+
+python app.py
+```
+
+打开 <http://127.0.0.1:8000>。首次启动会自动创建 `runtime/store-ai.sqlite3`，并写入一套美容院演示资料。该运行数据目录不会提交到 Git。
+
+本地接口：
+
+- `POST /api/chat`：客户对话、记忆提取和预约意向待办
+- `GET /api/tasks`：查看待跟进预约意向
+- `GET /api/memories`：查看客户记忆候选项
+- `POST /api/memories/{id}/approve`：确认记忆
+- `POST /api/memories/{id}/reject`：拒绝记忆
+- `GET /api/knowledge`：查看门店知识
+- `POST /api/knowledge`：新增已发布门店知识
+
 ## 产品原则
 
 ```text

@@ -1,0 +1,14 @@
+services:
+  ai-customer-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      STORE_AI_HOST: 0.0.0.0
+      STORE_AI_PORT: 8000
+      # Optional OpenAI-compatible model configuration:
+      # LLM_API_KEY: ${LLM_API_KEY}
+      # LLM_BASE_URL: https://api.deepseek.com/v1
+      # LLM_MODEL: deepseek-chat
+    volumes:
+      - ./runtime:/app/runtime
