@@ -54,7 +54,21 @@ class CustomerServiceTests(unittest.TestCase):
         self.service.llm.complete = lambda *_: "可以先做日常保湿和防晒。"
         result = self.service.chat({"message": "头皮护理是否适合油性发质？"})
         self.assertEqual(result["reply_mode"], "model_assisted")
+        self.assertIsNone(result["intent"])
         self.assertTrue(result["answer"].endswith("AI回复不作为治疗依据，建议转人工评估。"))
+
+    def test_related_knowledge_is_not_used_as_direct_answer_when_intent_is_not_covered(self):
+        self.service.llm.complete = lambda *_: "可以根据当前头皮状态先由美容师评估。"
+        result = self.service.chat({"message": "深层清洁能改善黑头吗？"})
+        self.assertEqual(result["reply_mode"], "model_assisted")
+        self.assertIsNone(result["intent"])
+        self.assertIn("美容师评估", result["answer"])
+
+    def test_precautions_intent_uses_published_precautions(self):
+        result = self.service.chat({"message": "护理前有什么注意事项？"})
+        self.assertEqual(result["intent"], "precautions")
+        self.assertEqual(result["reply_mode"], "knowledge_direct")
+        self.assertIn("红肿", result["answer"])
 
 
 if __name__ == "__main__":
