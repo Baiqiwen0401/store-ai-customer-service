@@ -131,7 +131,7 @@ class LLMClient:
         self.key = os.getenv("LLM_API_KEY")
         self.base = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
         self.model = os.getenv("LLM_MODEL", "deepseek-chat")
-        self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "75"))
+        self.timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
 
     def complete(self, system: str, user: str) -> str | None:
         if not self.key:
@@ -163,6 +163,13 @@ class CustomerService:
     NAME_RE = re.compile(r"(?:我叫|我是|姓名是)([\u4e00-\u9fa5]{2,4})")
     BUDGET_RE = re.compile(r"预算[^0-9]{0,5}(\d{2,5})\s*元?")
     TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
+    DIRECT_INTENTS = {
+        "price": ("多少钱", "价格", "收费", "费用", "价目"),
+        "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"),
+        "hours": ("营业时间", "几点开", "几点关", "开门", "下班"),
+        "appointment": ("预约", "预定", "有时间", "有空", "安排"),
+    }
+    CLINICAL_NOTICE = "\n\nAI回复不作为治疗依据，建议转人工评估。"
 
     def __init__(self, db: StoreDB):
         self.db = db
@@ -188,7 +195,7 @@ class CustomerService:
     def retrieve(self, tenant_id: str, message: str) -> list[str]:
         clean = re.sub(r"[^\u4e00-\u9fa5A-Za-z0-9]", "", message.lower())
         tokens = set(re.findall(r"[a-z0-9]{2,}", clean))
-        for size in (2, 3, 4):
+        for size in (3, 4):
             tokens.update(clean[i:i + size] for i in range(max(0, len(clean) - size + 1)))
         rows = self.db.query("SELECT title,content FROM knowledge WHERE tenant_id=? AND status='published'", (tenant_id,))
         scored = []
@@ -197,9 +204,27 @@ class CustomerService:
             scored.append((score, row["content"]))
         return [x[1] for x in sorted(scored, reverse=True) if x[0] > 0][:3]
 
+    def direct_documents(self, tenant_id: str, intent: str) -> list[str]:
+        intent_terms = {
+            "price": ("价格", "价目", "收费"),
+            "address": ("地址", "电话", "联系"),
+            "hours": ("营业", "时间"),
+            "appointment": ("预约", "营业", "时间"),
+        }
+        terms = intent_terms[intent]
+        rows = self.db.query("SELECT title,content FROM knowledge WHERE tenant_id=? AND status='published'", (tenant_id,))
+        return [row["content"] for row in rows if any(term in row["title"] or term in row["content"] for term in terms)][:3]
+
     def memories(self, tenant_id: str, customer_id: int) -> list[str]:
         rows = self.db.query("SELECT content FROM memories WHERE tenant_id=? AND customer_id=? AND status='approved' ORDER BY updated_at DESC", (tenant_id, customer_id))
         return [r["content"] for r in rows[:8]]
+
+    @classmethod
+    def direct_intent(cls, message: str) -> str | None:
+        for intent, phrases in cls.DIRECT_INTENTS.items():
+            if any(phrase in message for phrase in phrases):
+                return intent
+        return None
 
     def extract_memories(self, tenant_id: str, customer_id: int, message: str, memory_consent: bool):
         if not memory_consent:
@@ -218,28 +243,33 @@ class CustomerService:
             if not exists:
                 self.db.execute("INSERT INTO memories(tenant_id,customer_id,memory_type,content,source,confidence,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (tenant_id, customer_id, "customer", fact, "conversation", 0.86, "candidate", ts, ts))
 
-    def reply(self, tenant_id: str, customer_id: int, message: str) -> tuple[str, float, bool, str | None]:
+    def reply(self, tenant_id: str, customer_id: int, message: str) -> tuple[str, float, bool, str | None, str]:
         store = self.db.one("SELECT * FROM stores WHERE tenant_id=?", (tenant_id,))
-        docs = self.retrieve(tenant_id, message)
         memories = self.memories(tenant_id, customer_id)
         risk = self.RISK_RE.search(message)
         if risk:
-            return ("这个情况需要由门店工作人员进一步了解后给您建议。为了安全起见，我先为您转接人工客服，请稍候。", 0.98, True, f"触发风险词：{risk.group(0)}")
-        system = f"你是{store['name']}的客服。只能依据门店资料回答，不得编造价格、时间或效果。门店资料：{' | '.join(docs)}。客户已确认信息：{' | '.join(memories)}。回答简洁、友好，无法确认时转人工。"
-        llm_reply = self.llm.complete(system, message) if docs else None
+            return ("这个情况需要由门店工作人员进一步了解后给您建议。为了安全起见，我先为您转接人工客服，请稍候。", 0.98, True, f"触发风险词：{risk.group(0)}", "risk_handoff")
+        intent = self.direct_intent(message)
+        direct_docs = self.direct_documents(tenant_id, intent) if intent else []
+        if direct_docs and intent in {"price", "address", "hours"}:
+            return ("根据门店已发布资料：" + " ".join(direct_docs[:2]), 0.97, False, None, "knowledge_direct")
+        if direct_docs and intent == "appointment":
+            return ("可以帮您登记预约意向。" + " ".join(direct_docs[:2]) + " 请提供期望日期/时段、称呼和手机号，门店确认后才算预约成功。", 0.94, False, None, "knowledge_direct")
+        docs = self.retrieve(tenant_id, message)
+        system = (
+            f"你是{store['name']}的客服。优先使用以下门店资料：{' | '.join(docs) or '暂无直接匹配的门店资料'}。"
+            f"客户已确认信息：{' | '.join(memories) or '暂无'}。"
+            "若资料未覆盖，可提供保守的一般性美容护理信息，但不能诊断疾病、承诺疗效、给出处方或虚构门店价格、档期、政策。"
+            "回答简洁、友好；有不确定、健康或安全风险时建议转人工。"
+        )
+        llm_reply = self.llm.complete(system, message)
         if llm_reply:
-            return llm_reply, 0.88, False, None
+            return llm_reply.rstrip() + self.CLINICAL_NOTICE, 0.78, False, None, "model_assisted"
         if not docs:
             if self.APPOINT_RE.search(message):
-                return ("可以帮您登记预约意向。请告诉我想做的项目、期望日期/时段，以及您的称呼和手机号，门店确认后会联系您。", 0.72, False, None)
-            return ("我暂时没有在门店资料中找到这个问题的准确答案。可以留下您的问题和联系方式，我为您转给门店工作人员确认。", 0.35, True, "知识库未命中")
-        if any(k in message for k in ("价格", "多少钱", "收费")):
-            answer = "根据门店资料：" + " ".join(docs[:2])
-        elif self.APPOINT_RE.search(message):
-            answer = "可以帮您登记预约意向。" + " ".join(docs[:2]) + " 请提供期望日期/时段、称呼和手机号，门店确认后才算预约成功。"
-        else:
-            answer = docs[0]
-        return answer, 0.84, False, None
+                return ("可以帮您登记预约意向。请告诉我想做的项目、期望日期/时段，以及您的称呼和手机号，门店确认后会联系您。", 0.72, False, None, "appointment_fallback")
+            return ("我暂时没有在门店资料中找到这个问题的准确答案，且 AI 分析服务当前不可用。我已为您转人工确认。" + self.CLINICAL_NOTICE, 0.35, True, "知识库未命中且模型不可用", "handoff_fallback")
+        return (docs[0], 0.84, False, None, "knowledge_fallback")
 
     def chat(self, body: dict[str, Any]) -> dict[str, Any]:
         tenant_id = body.get("tenant_id", "demo-beauty")
@@ -257,7 +287,7 @@ class CustomerService:
             conversation_id = self.db.execute("INSERT INTO conversations(tenant_id,customer_id,channel,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", (tenant_id, customer_id, body.get("channel", "web"), "open", ts, ts))
         self.db.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", (conversation_id, "user", message, ts))
         self.extract_memories(tenant_id, customer_id, message, memory_consent)
-        answer, confidence, handoff, reason = self.reply(tenant_id, customer_id, message)
+        answer, confidence, handoff, reason, reply_mode = self.reply(tenant_id, customer_id, message)
         self.db.execute("INSERT INTO messages(conversation_id,role,content,confidence,created_at) VALUES(?,?,?,?,?)", (conversation_id, "assistant", answer, confidence, now()))
         if handoff:
             self.db.execute("UPDATE conversations SET status='handoff',handoff_reason=?,updated_at=? WHERE conversation_id=?", (reason, now(), conversation_id))
@@ -272,7 +302,7 @@ class CustomerService:
                 task_id = existing["task_id"]
             else:
                 task_id = self.db.execute("INSERT INTO tasks(tenant_id,customer_id,conversation_id,task_type,summary,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (tenant_id, customer_id, conversation_id, "appointment_lead", f"客户咨询预约：{message[:120]}", "pending", now(), now()))
-        return {"conversation_id": conversation_id, "customer_id": customer_id, "answer": answer, "confidence": confidence, "handoff": handoff, "handoff_reason": reason, "task_id": task_id, "memories_saved_as": "candidate"}
+        return {"conversation_id": conversation_id, "customer_id": customer_id, "answer": answer, "confidence": confidence, "handoff": handoff, "handoff_reason": reason, "task_id": task_id, "reply_mode": reply_mode, "memories_saved_as": "candidate"}
 
 
 DB = StoreDB()

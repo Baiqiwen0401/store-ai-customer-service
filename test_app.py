@@ -18,6 +18,7 @@ class CustomerServiceTests(unittest.TestCase):
     def test_knowledge_answer_and_customer_creation(self):
         result = self.service.chat({"message": "深层清洁多少钱？"})
         self.assertIn("268", result["answer"])
+        self.assertEqual(result["reply_mode"], "knowledge_direct")
         self.assertEqual(len(self.db.query("SELECT * FROM customers")), 1)
 
     def test_memory_is_candidate_until_approval(self):
@@ -41,6 +42,12 @@ class CustomerServiceTests(unittest.TestCase):
         self.service.chat({"conversation_id": first["conversation_id"], "customer_id": first["customer_id"], "message": "想预约深层清洁"})
         tasks = self.db.query("SELECT * FROM tasks WHERE task_type='appointment_lead'")
         self.assertEqual(len(tasks), 1)
+
+    def test_model_assisted_unknown_answer_has_safety_notice(self):
+        self.service.llm.complete = lambda *_: "可以先做日常保湿和防晒。"
+        result = self.service.chat({"message": "头皮护理是否适合油性发质？"})
+        self.assertEqual(result["reply_mode"], "model_assisted")
+        self.assertTrue(result["answer"].endswith("AI回复不作为治疗依据，建议转人工评估。"))
 
 
 if __name__ == "__main__":
