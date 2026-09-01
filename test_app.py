@@ -21,6 +21,13 @@ class CustomerServiceTests(unittest.TestCase):
         self.assertEqual(result["reply_mode"], "knowledge_direct")
         self.assertEqual(len(self.db.query("SELECT * FROM customers")), 1)
 
+    def test_service_overview_is_answered_from_knowledge(self):
+        result = self.service.chat({"message": "门店有哪些项目？"})
+        self.assertEqual(result["reply_mode"], "knowledge_direct")
+        self.assertFalse(result["handoff"])
+        self.assertIn("深层清洁", result["answer"])
+        self.assertNotIn("不得承诺", result["answer"])
+
     def test_memory_is_candidate_until_approval(self):
         result = self.service.chat({"message": "我是敏感肌，周六下午想做补水，预算 300 元", "memory_consent": True})
         self.assertIsNotNone(result["task_id"])
