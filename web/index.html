@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>悦己美容馆 · AI 客服</title>
+  <style>
+    :root{--ink:#17212b;--muted:#66727d;--line:#e4e8ec;--blue:#1769aa;--blue-soft:#edf5fb;--green:#247a58;--bg:#f7f9fb;--white:#fff;}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+    .shell{max-width:1180px;margin:0 auto;padding:22px}.top{display:flex;justify-content:space-between;align-items:end;border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:20px}.eyebrow{font-size:12px;color:var(--blue);font-weight:700;letter-spacing:.08em}.title{font-size:26px;font-weight:700;margin:2px 0}.sub{color:var(--muted)}.status{font-size:12px;color:var(--green);background:#eaf7f0;padding:6px 10px;border-radius:999px}
+    .grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(320px,.9fr);gap:18px}.panel{background:var(--white);border:1px solid var(--line);border-radius:8px;box-shadow:0 2px 8px #16324d08}.panel h2{font-size:16px;margin:0;padding:16px 18px;border-bottom:1px solid var(--line)}.chat{height:540px;display:flex;flex-direction:column}.messages{padding:18px;overflow:auto;flex:1}.msg{max-width:82%;padding:10px 12px;border-radius:8px;margin:0 0 12px;white-space:pre-wrap}.user{margin-left:auto;background:var(--blue);color:white;border-bottom-right-radius:2px}.assistant{background:var(--blue-soft);border-bottom-left-radius:2px}.meta{font-size:11px;color:var(--muted);margin-top:4px}.compose{display:grid;grid-template-columns:125px 145px minmax(0,1fr) auto;gap:8px;padding:12px;border-top:1px solid var(--line)}input,textarea{font:inherit;border:1px solid #ccd5dd;border-radius:6px;padding:9px;background:#fff}input:focus,textarea:focus{outline:2px solid #c8e1f3;border-color:var(--blue)}.btn{border:0;border-radius:6px;padding:9px 14px;background:var(--blue);color:white;font-weight:600;cursor:pointer}.btn.secondary{background:#edf1f4;color:var(--ink)}.consent{grid-column:1/-1;font-size:12px;color:var(--muted);display:flex;gap:7px;align-items:center}.consent input{width:15px;height:15px;padding:0}
+    .side{display:grid;gap:18px;align-content:start}.statrow{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:16px}.stat{border:1px solid var(--line);border-radius:7px;padding:12px}.stat b{font-size:23px;display:block}.stat span{font-size:12px;color:var(--muted)}.list{padding:4px 16px 14px;max-height:250px;overflow:auto}.item{padding:11px 0;border-bottom:1px solid var(--line)}.item:last-child{border-bottom:0}.tag{display:inline-block;font-size:11px;padding:2px 7px;border-radius:999px;background:#edf1f4;color:var(--muted);margin-right:5px}.tag.pending{background:#fff5db;color:#8b6200}.tag.handoff{background:#fdecec;color:#9b1c1c}.tag.candidate{background:#fff5db;color:#8b6200}.tag.approved{background:#eaf7f0;color:var(--green)}.actions{margin-top:7px;display:flex;gap:6px}.actions button{font-size:12px;padding:5px 8px}.empty{color:var(--muted);padding:15px 0}.note{padding:12px 16px;background:#fff9e9;border-top:1px solid #f1e4b5;color:#725a1a;font-size:12px}.knowledge{padding:14px 16px;display:grid;gap:8px}.knowledge textarea{min-height:72px;resize:vertical}.knowledge-list{font-size:12px;color:var(--muted);padding:0 16px 14px}.knowledge-list div{padding:6px 0;border-top:1px solid var(--line)}
+    @media(max-width:800px){.shell{padding:12px}.top{align-items:start;gap:10px;flex-direction:column}.grid{grid-template-columns:1fr}.chat{height:500px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top"><div><div class="eyebrow">STORE AI CUSTOMER SERVICE · MVP</div><div class="title" id="storeName">悦己美容馆</div><div class="sub">客户咨询、长期记忆与门店待办</div></div><div class="status">● 在线运行</div></header>
+    <section class="grid">
+      <div class="panel chat"><h2>客户咨询预览</h2><div id="messages" class="messages"><div class="msg assistant">您好，我是悦己美容馆 AI 客服，很高兴为您服务。您可以咨询项目、价格、注意事项或预约。</div></div><div class="compose"><input id="name" placeholder="称呼（可选）" /><input id="phone" placeholder="手机号（绑定记忆）" inputmode="tel" /><input id="input" placeholder="例如：我是敏感肌，周六下午想做补水" /><button class="btn" onclick="send()">发送</button><label class="consent"><input id="consent" type="checkbox" /> 我同意门店为本次咨询和后续服务保存必要客户记忆；未勾选时可匿名咨询。</label></div><div class="note">演示环境：AI 只基于已发布资料回答；敏感、投诉、退款和医疗美容问题会自动转人工。</div></div>
+      <aside class="side">
+        <div class="panel"><h2>运营概览</h2><div class="statrow"><div class="stat"><b id="customerCount">0</b><span>客户档案</span></div><div class="stat"><b id="taskCount">0</b><span>待跟进</span></div><div class="stat"><b id="memoryCount">0</b><span>待审核记忆</span></div></div></div>
+        <div class="panel"><h2>预约与跟进</h2><div id="tasks" class="list"></div></div>
+        <div class="panel"><h2>客户记忆审核</h2><div id="memories" class="list"></div></div>
+        <div class="panel"><h2>转人工会话</h2><div id="handoffs" class="list"></div></div>
+        <div class="panel"><h2>门店知识维护</h2><div class="knowledge"><input id="knowledgeTitle" placeholder="例如：国庆优惠规则" /><textarea id="knowledgeContent" placeholder="填写门店已确认、可对客户公开的规则或资料"></textarea><button class="btn" onclick="addKnowledge()">发布知识</button></div><div id="knowledge" class="knowledge-list"></div></div>
+      </aside>
+    </section>
+  </main>
+  <script>
+    const $=id=>document.getElementById(id);
+    async function api(path,opt){const r=await fetch(path,opt);const d=await r.json();if(!r.ok)throw Error(d.error||'请求失败');return d}
+    function add(role,text,meta=''){const p=document.createElement('div');p.className='msg '+role;p.textContent=text;if(meta){const m=document.createElement('div');m.className='meta';m.textContent=meta;p.appendChild(m)}$('messages').appendChild(p);$('messages').scrollTop=1e9}
+    let conversationId=null,customerId=null;
+    async function send(){const el=$('input'),message=el.value.trim(),phone=$('phone').value.trim(),consent=$('consent').checked;if(!message)return;if(phone&&!consent){add('assistant','如需用手机号保存长期记忆，请先勾选同意；也可以清空手机号后匿名咨询。');return}add('user',message);el.value='';const pending=document.createElement('div');pending.className='msg assistant';pending.textContent='正在整理门店资料，请稍候…';$('messages').appendChild(pending);$('messages').scrollTop=1e9;try{const d=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,name:$('name').value.trim()||null,phone:phone||null,memory_consent:consent,customer_id:customerId,conversation_id:conversationId,channel:'web'})});pending.remove();conversationId=d.conversation_id;customerId=d.customer_id;add('assistant',d.answer,`置信度 ${(d.confidence*100).toFixed(0)}%${d.handoff?' · 已转人工':''}`);refresh()}catch(e){pending.remove();add('assistant','系统暂时无法响应：'+e.message)}}
+    $('input').addEventListener('keydown',e=>{if(e.key==='Enter')send()});
+    async function refresh(){const [cs,ts,ms,convs,ks]=await Promise.all([api('/api/customers'),api('/api/tasks'),api('/api/memories'),api('/api/conversations'),api('/api/knowledge')]);$('customerCount').textContent=cs.length;$('taskCount').textContent=ts.filter(x=>x.status==='pending').length;$('memoryCount').textContent=ms.filter(x=>x.status==='candidate').length;
+      $('tasks').innerHTML=ts.length?ts.map(x=>`<div class="item"><span class="tag ${x.status}">${x.status==='pending'?'待跟进':x.status}</span>${escapeHtml(x.summary)}${x.status==='pending'?`<div class="actions"><button class="btn secondary" onclick="completeTask(${x.task_id})">标记完成</button></div>`:''}</div>`).join(''):'<div class="empty">暂无待办</div>';
+      $('memories').innerHTML=ms.length?ms.map(x=>`<div class="item"><span class="tag ${x.status}">${x.status==='candidate'?'待审核':x.status}</span>${escapeHtml(x.content)}<div class="meta">客户：${escapeHtml(x.name||'未命名')}</div>${x.status==='candidate'?`<div class="actions"><button class="btn" onclick="memory(${x.memory_id},'approve')">确认</button><button class="btn secondary" onclick="memory(${x.memory_id},'reject')">拒绝</button></div>`:''}</div>`).join(''):'<div class="empty">暂无记忆</div>';
+      const hs=convs.filter(x=>x.status==='handoff');$('handoffs').innerHTML=hs.length?hs.map(x=>`<div class="item"><span class="tag handoff">需接管</span>${escapeHtml(x.name||x.phone||'匿名客户')}<div class="meta">${escapeHtml(x.handoff_reason||'需人工处理')} · ${escapeHtml(x.last_message||'')}</div></div>`).join(''):'<div class="empty">暂无转人工会话</div>';
+      $('knowledge').innerHTML=ks.map(x=>`<div><b>${escapeHtml(x.title)}</b><br>${escapeHtml(x.content)}</div>`).join('');
+    }
+    const escapeHtml=s=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    async function memory(id,a){await api(`/api/memories/${id}/${a}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});refresh()};async function completeTask(id){await api(`/api/tasks/${id}/complete`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});refresh()};async function addKnowledge(){const title=$('knowledgeTitle').value.trim(),content=$('knowledgeContent').value.trim();if(!title||!content)return;await api('/api/knowledge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,content})});$('knowledgeTitle').value='';$('knowledgeContent').value='';refresh()};refresh();
+  </script>
+</body>
+</html>
