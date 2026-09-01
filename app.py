@@ -165,6 +165,7 @@ class CustomerService:
     TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
     DIRECT_INTENTS = {
         "price": ("多少钱", "价格", "收费", "费用", "价目"),
+        "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "做什么项目", "做什么护理"),
         "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"),
         "hours": ("营业时间", "几点开", "几点关", "开门", "下班"),
         "appointment": ("预约", "预定", "有时间", "有空", "安排"),
@@ -205,6 +206,12 @@ class CustomerService:
         return [x[1] for x in sorted(scored, reverse=True) if x[0] > 0][:3]
 
     def direct_documents(self, tenant_id: str, intent: str) -> list[str]:
+        rows = self.db.query("SELECT title,content FROM knowledge WHERE tenant_id=? AND status='published'", (tenant_id,))
+        if intent == "services":
+            return [
+                row["content"] for row in rows
+                if "项目" in row["title"] or "服务项目" in row["title"]
+            ][:3]
         intent_terms = {
             "price": ("价格", "价目", "收费"),
             "address": ("地址", "电话", "联系"),
@@ -212,7 +219,6 @@ class CustomerService:
             "appointment": ("预约", "营业", "时间"),
         }
         terms = intent_terms[intent]
-        rows = self.db.query("SELECT title,content FROM knowledge WHERE tenant_id=? AND status='published'", (tenant_id,))
         return [row["content"] for row in rows if any(term in row["title"] or term in row["content"] for term in terms)][:3]
 
     def memories(self, tenant_id: str, customer_id: int) -> list[str]:
@@ -253,6 +259,8 @@ class CustomerService:
         direct_docs = self.direct_documents(tenant_id, intent) if intent else []
         if direct_docs and intent in {"price", "address", "hours"}:
             return ("根据门店已发布资料：" + " ".join(direct_docs[:2]), 0.97, False, None, "knowledge_direct")
+        if direct_docs and intent == "services":
+            return ("目前门店已发布的项目如下：" + " ".join(direct_docs[:3]) + " 如需了解适用情况或预约时间，可以继续告诉我您的需求。", 0.97, False, None, "knowledge_direct")
         if direct_docs and intent == "appointment":
             return ("可以帮您登记预约意向。" + " ".join(direct_docs[:2]) + " 请提供期望日期/时段、称呼和手机号，门店确认后才算预约成功。", 0.94, False, None, "knowledge_direct")
         docs = self.retrieve(tenant_id, message)
