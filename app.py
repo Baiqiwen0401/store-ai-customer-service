@@ -181,7 +181,11 @@ class CustomerService:
         return cid
     def _knowledge(self, tenant_id, intent=None, published_only=True):
         clause = " AND status='published'" if published_only else ""
-        if intent: return self.db.query(f"SELECT * FROM knowledge WHERE tenant_id=? AND (intent=? OR category=?) {clause} ORDER BY version DESC,updated_at DESC", (tenant_id, intent, intent))
+        if intent:
+            rows = self.db.query(f"SELECT * FROM knowledge WHERE tenant_id=? AND intent=? {clause} ORDER BY version DESC,updated_at DESC", (tenant_id, intent))
+            if rows:
+                return rows
+            return self.db.query(f"SELECT * FROM knowledge WHERE tenant_id=? AND category=? {clause} ORDER BY version DESC,updated_at DESC", (tenant_id, intent))
         return self.db.query(f"SELECT * FROM knowledge WHERE tenant_id=? {clause} ORDER BY updated_at DESC", (tenant_id,))
     @staticmethod
     def _search_terms(message):

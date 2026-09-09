@@ -65,7 +65,7 @@
   {
     "title": "优惠活动说明",
     "content": "优惠、团购、赠送项目和活动有效期以门店当前发布内容为准。AI 不会自行生成优惠金额、使用条件或截止日期；未找到明确资料时会请门店确认。",
-    "category": "packages",
+    "category": "promotion",
     "intent": "promotion",
     "source": "market_faq_reviewed"
   },

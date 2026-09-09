@@ -77,6 +77,7 @@ class CustomerServiceTests(unittest.TestCase):
         self.assertFalse(result["handoff"])
         self.assertIsNone(result["task_id"])
         self.assertIn("项目组合", result["answer"])
+        self.assertNotIn("优惠、团购", result["answer"])
 
 
 if __name__ == "__main__":
