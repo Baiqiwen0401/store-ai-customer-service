@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -9,18 +10,40 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from ai_gateway import DifyWorkflowClient
+
 ROOT = Path(__file__).parent
+ENVIRONMENT = os.getenv("STORE_AI_ENV", "development").strip().lower()
 DB_PATH = Path(os.getenv("STORE_AI_DB_PATH", str(ROOT / "runtime" / "store-ai.sqlite3")))
 HOST = os.getenv("STORE_AI_HOST", "127.0.0.1")
 PORT = int(os.getenv("STORE_AI_PORT", "8000"))
 TENANT_DEFAULT = os.getenv("STORE_AI_TENANT", "demo-beauty")
 STAFF_ACCESS_KEY = os.getenv("STAFF_ACCESS_KEY", "")
+MAX_BODY_BYTES = max(16 * 1024, int(os.getenv("STORE_AI_MAX_BODY_BYTES", "262144")))
+_origins = os.getenv("STORE_AI_ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS = {origin.strip() for origin in _origins.split(",") if origin.strip()} or {"*"}
+LOGGER = logging.getLogger("store_ai")
+logging.basicConfig(level=os.getenv("STORE_AI_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+def validate_startup_config() -> None:
+    """Fail fast on unsafe production settings while keeping local setup zero-config."""
+    if ENVIRONMENT == "production" and not STAFF_ACCESS_KEY:
+        raise RuntimeError("生产环境必须配置 STAFF_ACCESS_KEY")
+    if ENVIRONMENT == "production" and ALLOWED_ORIGINS == {"*"}:
+        raise RuntimeError("生产环境必须配置 STORE_AI_ALLOWED_ORIGINS，禁止使用通配 CORS")
+    if ENVIRONMENT == "production" and DB_PATH.suffix in {".db", ".sqlite", ".sqlite3"}:
+        LOGGER.warning("生产环境当前仍使用 SQLite；阶段 2 完成前不应承载高并发或关键生产数据")
+
+
+validate_startup_config()
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -88,7 +111,7 @@ class StoreDB:
 
 class LLMClient:
     def __init__(self, db: StoreDB | None = None):
-        self.db = db; self.key = os.getenv("LLM_API_KEY"); self.base = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/"); self.model = os.getenv("LLM_MODEL", "deepseek-chat"); self.timeout = max(3, int(os.getenv("LLM_TIMEOUT_SECONDS", "8"))); self.last_status = {"configured": bool(self.key), "model": self.model, "base_url": self.base, "outcome": "not_checked"}
+        self.db = db; self.key = os.getenv("LLM_API_KEY"); self.base = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/"); self.model = os.getenv("LLM_MODEL", "deepseek-chat"); self.timeout = max(3, int(os.getenv("LLM_TIMEOUT_SECONDS", "8"))); self.dify = DifyWorkflowClient(); self.last_status = {"configured": bool(self.key or self.dify.enabled), "provider": "dify" if self.dify.enabled else "openai_compatible", "model": self.model, "base_url": self.base, "outcome": "not_checked"}
     def complete(self, system: str, user: str, *, tenant_id=None, conversation_id=None) -> str | None:
         started = time.perf_counter()
         if not self.key: self._record(tenant_id, conversation_id, "not_configured", None, started, "configuration", "LLM_API_KEY 未配置"); return None
@@ -103,9 +126,17 @@ class LLMClient:
         except (urllib.error.URLError, OSError) as exc: self._record(tenant_id, conversation_id, "error", None, started, "network", str(getattr(exc, "reason", exc)))
         except Exception as exc: self._record(tenant_id, conversation_id, "error", None, started, "invalid_response", str(exc))
         return None
-    def _record(self, tenant_id, conversation_id, outcome, status, started, category, message):
-        latency = int((time.perf_counter() - started) * 1000); self.last_status = {"configured": bool(self.key), "model": self.model, "base_url": self.base, "outcome": outcome, "http_status": status, "latency_ms": latency, "error_category": category, "error_message": message}
-        if self.db: self.db.execute("INSERT INTO model_events(tenant_id,conversation_id,model,outcome,http_status,latency_ms,error_category,error_message,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (tenant_id, conversation_id, self.model, outcome, status, latency, category, message, now()))
+    def complete_with_context(self, system: str, user: str, *, tenant_id=None, conversation_id=None, intent=None, knowledge_context=None, memories=None) -> str | None:
+        """Prefer a configured Dify Workflow, otherwise keep the direct model fallback."""
+        if self.dify.enabled:
+            started = time.perf_counter()
+            text, result = self.dify.run(query=user, tenant_id=str(tenant_id or TENANT_DEFAULT), conversation_id=int(conversation_id or 0), intent=intent, knowledge_context=list(knowledge_context or []), memories=list(memories or []))
+            self._record(tenant_id, conversation_id, result.get("outcome", "error"), result.get("http_status"), started, result.get("error_category"), result.get("error_message"), model="dify-workflow")
+            return text
+        return self.complete(system, user, tenant_id=tenant_id, conversation_id=conversation_id)
+    def _record(self, tenant_id, conversation_id, outcome, status, started, category, message, model=None):
+        latency = int((time.perf_counter() - started) * 1000); self.last_status = {"configured": bool(self.key or self.dify.enabled), "provider": "dify" if self.dify.enabled else "openai_compatible", "model": model or self.model, "base_url": self.dify.base_url if self.dify.enabled else self.base, "outcome": outcome, "http_status": status, "latency_ms": latency, "error_category": category, "error_message": message}
+        if self.db: self.db.execute("INSERT INTO model_events(tenant_id,conversation_id,model,outcome,http_status,latency_ms,error_category,error_message,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (tenant_id, conversation_id, model or self.model, outcome, status, latency, category, message, now()))
 
 class CustomerService:
     RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|副作用")
@@ -163,7 +194,7 @@ class CustomerService:
         if direct and intent == "appointment": return ("可以帮您登记预约意向。请提供期望日期/时段、称呼和手机号，门店确认后才算预约成功。", 0.94, False, None, "knowledge_direct", intent)
         docs = self.retrieve(tenant_id, message); memories = self.memories(tenant_id, customer_id); system = f"你是{store['name']}的专业美容院在线客服。客户意图：{intent or 'general_consultation'}。\n门店资料（仅可作为事实依据）：{' | '.join(docs) or '暂无直接匹配'}\n已确认客户偏好：{' | '.join(memories) or '暂无'}\n资料没有覆盖的项目、价格、时间、政策不得编造；可以提供保守的一般护理建议。涉及健康风险时建议人工评估，回答简洁友好。"
         try:
-            llm_reply = self.llm.complete(system, message, tenant_id=tenant_id, conversation_id=conversation_id)
+            llm_reply = self.llm.complete_with_context(system, message, tenant_id=tenant_id, conversation_id=conversation_id, intent=intent, knowledge_context=docs, memories=memories)
         except TypeError:
             # Keep compatibility with simple test doubles and local adapters.
             llm_reply = self.llm.complete(system, message)
@@ -191,23 +222,89 @@ class CustomerService:
 DB = StoreDB(); SERVICE = CustomerService(DB)
 def row_dict(row): return dict(row) if row else None
 
+
+def audit_event(tenant_id, actor, action, entity_type, entity_id=None, detail=None):
+    """Write a compact, tenant-scoped audit record for staff and system actions."""
+    DB.execute(
+        "INSERT INTO audit_log(tenant_id,actor,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?)",
+        (tenant_id, actor, action, entity_type, entity_id, json.dumps(detail or {}, ensure_ascii=False), now()),
+    )
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "StoreAI/1.0"
     def log_message(self, *_): return
     def send_json(self, payload, status=200):
-        data = json.dumps(payload, ensure_ascii=False).encode(); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(data)
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        request_id = self.headers.get("X-Request-ID") or str(uuid.uuid4())
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        origin = self.headers.get("Origin")
+        if "*" in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin and origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Request-ID", request_id)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
     def body(self):
-        length = int(self.headers.get("Content-Length", "0")); return json.loads(self.rfile.read(length) or b"{}")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Content-Length 无效") from exc
+        if length > MAX_BODY_BYTES:
+            raise ValueError(f"请求体不能超过 {MAX_BODY_BYTES} 字节")
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("请求 JSON 格式无效") from exc
     def tenant(self, body=None):
-        query = parse_qs(urlparse(self.path).query); return str((body or {}).get("tenant_id") or query.get("tenant_id", [TENANT_DEFAULT])[0])
-    def staff_ok(self): return not STAFF_ACCESS_KEY or self.headers.get("X-Staff-Key") == STAFF_ACCESS_KEY
+        query = parse_qs(urlparse(self.path).query)
+        candidate = str(self.headers.get("X-Tenant-ID") or (body or {}).get("tenant_id") or query.get("tenant_id", [TENANT_DEFAULT])[0])
+        if ENVIRONMENT == "production" and candidate != TENANT_DEFAULT and not self.staff_ok():
+            raise PermissionError("租户上下文无效")
+        return candidate
+    def staff_ok(self):
+        return (not STAFF_ACCESS_KEY and ENVIRONMENT != "production") or self.headers.get("X-Staff-Key") == STAFF_ACCESS_KEY
     def do_OPTIONS(self):
-        self.send_response(204); self.send_header("Access-Control-Allow-Origin", "*"); self.send_header("Access-Control-Allow-Headers", "Content-Type,X-Staff-Key"); self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS"); self.end_headers()
+        self.send_response(204)
+        origin = self.headers.get("Origin")
+        if "*" in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin and origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-Staff-Key,X-Tenant-ID,Idempotency-Key")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
     def do_GET(self):
         path = urlparse(self.path).path
         try:
             if path in ("/", "/index.html"):
                 data = (ROOT / "web" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+            if path == "/api/health":
+                database_ok = False
+                try:
+                    database_ok = DB.one("SELECT 1 AS ok")['ok'] == 1
+                except Exception:
+                    LOGGER.exception("health database check failed")
+                healthy = database_ok
+                self.send_json({"status": "ok" if healthy else "degraded", "environment": ENVIRONMENT, "database": "ok" if database_ok else "error", "model_configured": bool(SERVICE.llm.key)})
+                return
+            protected_get = (
+                path == "/api/model-status"
+                or path in {"/api/customers", "/api/tasks", "/api/conversations", "/api/memories", "/api/knowledge", "/api/audit"}
+                or bool(re.fullmatch(r"/api/conversations/\d+", path))
+            )
+            if protected_get and not self.staff_ok():
+                self.send_json({"error": "需要门店工作台权限"}, 401)
+                return
             tenant = self.tenant()
             if path == "/api/store": self.send_json(row_dict(DB.one("SELECT * FROM stores WHERE tenant_id=?", (tenant,)))); return
             if path == "/api/model-status":
@@ -224,7 +321,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/knowledge": self.send_json([dict(r) for r in DB.query("SELECT * FROM knowledge WHERE tenant_id=? ORDER BY updated_at DESC,version DESC", (tenant,))]); return
             if path == "/api/audit": self.send_json([dict(r) for r in DB.query("SELECT * FROM audit_log WHERE tenant_id=? ORDER BY audit_id DESC LIMIT 100", (tenant,))]); return
             self.send_json({"error": "Not found"}, 404)
-        except Exception as exc: self.send_json({"error": "服务内部错误", "detail": str(exc)}, 500)
+        except PermissionError as exc:
+            self.send_json({"error": str(exc)}, 403)
+        except Exception as exc:
+            LOGGER.exception("GET %s failed", path)
+            payload = {"error": "服务内部错误"}
+            if ENVIRONMENT != "production":
+                payload["detail"] = str(exc)
+            self.send_json(payload, 500)
     def do_POST(self):
         path = urlparse(self.path).path
         try:
@@ -233,38 +337,51 @@ class Handler(BaseHTTPRequestHandler):
             if not self.staff_ok(): self.send_json({"error": "需要门店工作台权限"}, 401); return
             match = re.fullmatch(r"/api/memories/(\d+)/(approve|reject)", path)
             if match:
-                status = "approved" if match.group(2) == "approve" else "rejected"; DB.execute("UPDATE memories SET status=?,reviewed_by=?,reviewed_at=?,updated_at=? WHERE memory_id=? AND tenant_id=?", (status, body.get("actor", "staff"), now(), now(), int(match.group(1)), tenant)); self.send_json({"ok": True, "status": status}); return
+                status = "approved" if match.group(2) == "approve" else "rejected"; actor = str(body.get("actor") or "staff"); memory_id = int(match.group(1)); DB.execute("UPDATE memories SET status=?,reviewed_by=?,reviewed_at=?,updated_at=? WHERE memory_id=? AND tenant_id=?", (status, actor, now(), now(), memory_id, tenant)); audit_event(tenant, actor, f"memory_{status}", "memory", memory_id); self.send_json({"ok": True, "status": status}); return
             match = re.fullmatch(r"/api/tasks/(\d+)/(complete|cancel)", path)
             if match:
-                status = "completed" if match.group(2) == "complete" else "cancelled"; DB.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=? AND tenant_id=?", (status, now(), int(match.group(1)), tenant)); self.send_json({"ok": True, "status": status}); return
+                status = "completed" if match.group(2) == "complete" else "cancelled"; actor = str(body.get("actor") or "staff"); task_id = int(match.group(1)); DB.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=? AND tenant_id=?", (status, now(), task_id, tenant)); audit_event(tenant, actor, f"task_{status}", "task", task_id); self.send_json({"ok": True, "status": status}); return
             match = re.fullmatch(r"/api/conversations/(\d+)/(claim|reply|resume|close)", path)
             if match:
                 conv_id, action = int(match.group(1)), match.group(2); conv = DB.one("SELECT * FROM conversations WHERE conversation_id=? AND tenant_id=?", (conv_id, tenant))
                 if not conv: self.send_json({"error": "会话不存在"}, 404); return
                 actor = str(body.get("assignee") or body.get("actor") or "staff")
-                if action == "claim": DB.execute("UPDATE conversations SET status='human',ai_enabled=0,assigned_to=?,updated_at=? WHERE conversation_id=?", (actor, now(), conv_id)); self.send_json({"ok": True, "status": "human", "assigned_to": actor}); return
+                if action == "claim": DB.execute("UPDATE conversations SET status='human',ai_enabled=0,assigned_to=?,updated_at=? WHERE conversation_id=?", (actor, now(), conv_id)); audit_event(tenant, actor, "conversation_claim", "conversation", conv_id); self.send_json({"ok": True, "status": "human", "assigned_to": actor}); return
                 if action == "reply":
                     content = str(body.get("message") or "").strip()
                     if not content: raise ValueError("回复内容不能为空")
-                    DB.execute("INSERT INTO messages(conversation_id,role,content,confidence,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (conv_id, "human", content, 1.0, json.dumps({"actor": actor}, ensure_ascii=False), now())); DB.execute("UPDATE conversations SET status='human',ai_enabled=0,assigned_to=?,updated_at=? WHERE conversation_id=?", (actor, now(), conv_id)); self.send_json({"ok": True, "status": "human"}); return
-                if action == "resume": DB.execute("UPDATE conversations SET status='open',ai_enabled=1,updated_at=? WHERE conversation_id=?", (now(), conv_id)); self.send_json({"ok": True, "status": "open"}); return
-                DB.execute("UPDATE conversations SET status='closed',ai_enabled=0,updated_at=? WHERE conversation_id=?", (now(), conv_id)); self.send_json({"ok": True, "status": "closed"}); return
+                    DB.execute("INSERT INTO messages(conversation_id,role,content,confidence,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (conv_id, "human", content, 1.0, json.dumps({"actor": actor}, ensure_ascii=False), now())); DB.execute("UPDATE conversations SET status='human',ai_enabled=0,assigned_to=?,updated_at=? WHERE conversation_id=?", (actor, now(), conv_id)); audit_event(tenant, actor, "conversation_reply", "conversation", conv_id); self.send_json({"ok": True, "status": "human"}); return
+                if action == "resume": DB.execute("UPDATE conversations SET status='open',ai_enabled=1,updated_at=? WHERE conversation_id=?", (now(), conv_id)); audit_event(tenant, actor, "conversation_resume", "conversation", conv_id); self.send_json({"ok": True, "status": "open"}); return
+                DB.execute("UPDATE conversations SET status='closed',ai_enabled=0,updated_at=? WHERE conversation_id=?", (now(), conv_id)); audit_event(tenant, actor, "conversation_close", "conversation", conv_id); self.send_json({"ok": True, "status": "closed"}); return
             if path == "/api/knowledge":
                 title, content = str(body.get("title") or "").strip(), str(body.get("content") or "").strip()
                 if not title or not content: raise ValueError("标题和内容不能为空")
-                status = body.get("status", "draft") if body.get("status") in {"draft", "published"} else "draft"; kid = DB.execute("INSERT INTO knowledge(tenant_id,title,content,category,intent,status,version,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (tenant, title, content, body.get("category", "general"), body.get("intent"), status, 1, "manual", now(), now())); self.send_json({"knowledge_id": kid, "status": status}); return
+                status = body.get("status", "draft") if body.get("status") in {"draft", "published"} else "draft"; kid = DB.execute("INSERT INTO knowledge(tenant_id,title,content,category,intent,status,version,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (tenant, title, content, body.get("category", "general"), body.get("intent"), status, 1, "manual", now(), now())); audit_event(tenant, str(body.get("actor") or "staff"), "knowledge_create", "knowledge", kid, {"status": status}); self.send_json({"knowledge_id": kid, "status": status}); return
             self.send_json({"error": "Not found"}, 404)
         except ValueError as exc: self.send_json({"error": str(exc)}, 400)
-        except Exception as exc: self.send_json({"error": "服务内部错误", "detail": str(exc)}, 500)
+        except PermissionError as exc: self.send_json({"error": str(exc)}, 403)
+        except Exception as exc:
+            LOGGER.exception("POST %s failed", path)
+            payload = {"error": "服务内部错误"}
+            if ENVIRONMENT != "production":
+                payload["detail"] = str(exc)
+            self.send_json(payload, 500)
     def do_PUT(self):
         path = urlparse(self.path).path
         if not self.staff_ok(): self.send_json({"error": "需要门店工作台权限"}, 401); return
         try:
             body = self.body(); tenant = self.tenant(body); match = re.fullmatch(r"/api/knowledge/(\d+)/(publish|archive)", path)
             if match:
-                status = "published" if match.group(2) == "publish" else "archived"; DB.execute("UPDATE knowledge SET status=?,updated_at=? WHERE knowledge_id=? AND tenant_id=?", (status, now(), int(match.group(1)), tenant)); self.send_json({"ok": True, "status": status}); return
+                status = "published" if match.group(2) == "publish" else "archived"; knowledge_id = int(match.group(1)); actor = str(body.get("actor") or "staff"); DB.execute("UPDATE knowledge SET status=?,updated_at=? WHERE knowledge_id=? AND tenant_id=?", (status, now(), knowledge_id, tenant)); audit_event(tenant, actor, f"knowledge_{status}", "knowledge", knowledge_id); self.send_json({"ok": True, "status": status}); return
             self.send_json({"error": "Not found"}, 404)
-        except Exception as exc: self.send_json({"error": "服务内部错误", "detail": str(exc)}, 500)
+        except ValueError as exc: self.send_json({"error": str(exc)}, 400)
+        except PermissionError as exc: self.send_json({"error": str(exc)}, 403)
+        except Exception as exc:
+            LOGGER.exception("PUT %s failed", path)
+            payload = {"error": "服务内部错误"}
+            if ENVIRONMENT != "production":
+                payload["detail"] = str(exc)
+            self.send_json(payload, 500)
 
 def main():
     print(f"AI 客服 running at http://{HOST}:{PORT}"); ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

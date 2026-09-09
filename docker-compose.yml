@@ -4,8 +4,13 @@ services:
     ports:
       - "8000:8000"
     environment:
+      STORE_AI_ENV: ${STORE_AI_ENV:-development}
       STORE_AI_HOST: 0.0.0.0
       STORE_AI_PORT: 8000
+      STORE_AI_ALLOWED_ORIGINS: ${STORE_AI_ALLOWED_ORIGINS:-http://127.0.0.1:8000}
+      STORE_AI_MAX_BODY_BYTES: ${STORE_AI_MAX_BODY_BYTES:-262144}
+      STORE_AI_LOG_LEVEL: ${STORE_AI_LOG_LEVEL:-INFO}
+      STAFF_ACCESS_KEY: ${STAFF_ACCESS_KEY:-}
       # Optional OpenAI-compatible model configuration:
       # LLM_API_KEY: ${LLM_API_KEY}
       # LLM_BASE_URL: https://api.deepseek.com/v1
