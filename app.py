@@ -139,10 +139,10 @@ class LLMClient:
         if self.db: self.db.execute("INSERT INTO model_events(tenant_id,conversation_id,model,outcome,http_status,latency_ms,error_category,error_message,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (tenant_id, conversation_id, model or self.model, outcome, status, latency, category, message, now()))
 
 class CustomerService:
-    RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|副作用")
+    RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|百分百|100%|副作用")
     APPOINT_RE = re.compile(r"预约|预定|有时间|有空|安排|周[一二三四五六日天]|上午|下午|晚上")
     BUDGET_RE = re.compile(r"预算[^0-9]{0,5}(\d{2,5})\s*元?"); TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
-    INTENT_RULES = {"price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "几点开", "几点关", "开门", "下班"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议")}
+    INTENT_RULES = {"price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议")}
     CLINICAL_NOTICE = "\n\nAI回复不作为治疗依据，建议转人工评估。"
     def __init__(self, db): self.db = db; self.llm = LLMClient(db)
     @classmethod
@@ -166,12 +166,26 @@ class CustomerService:
         clause = " AND status='published'" if published_only else ""
         if intent: return self.db.query(f"SELECT * FROM knowledge WHERE tenant_id=? AND (intent=? OR category=?) {clause} ORDER BY version DESC,updated_at DESC", (tenant_id, intent, intent))
         return self.db.query(f"SELECT * FROM knowledge WHERE tenant_id=? {clause} ORDER BY updated_at DESC", (tenant_id,))
-    def retrieve(self, tenant_id, message):
-        tokens = set(re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]{2,}", message.lower())); scored = []
+    @staticmethod
+    def _search_terms(message):
+        normalized = re.sub(r"\s+", "", message.lower())
+        words = set(re.findall(r"[a-z0-9][a-z0-9_-]*|[\u4e00-\u9fa5]", normalized))
+        bigrams = {normalized[index:index + 2] for index in range(max(0, len(normalized) - 1)) if re.search(r"[\u4e00-\u9fa5]", normalized[index:index + 2])}
+        return words | bigrams
+    def retrieve_context(self, tenant_id, message, limit=4):
+        terms = self._search_terms(message)
+        scored = []
         for row in self._knowledge(tenant_id):
-            haystack = (row["title"] + row["content"]).lower(); score = sum(1 for token in tokens if token in haystack)
-            if score: scored.append((score, row["content"]))
-        return [content for _, content in sorted(scored, reverse=True)[:4]]
+            title = str(row["title"]); content = str(row["content"]); haystack = (title + content).lower()
+            matched = sorted(term for term in terms if term in haystack)
+            if not matched:
+                continue
+            title_hits = sum(1 for term in matched if term in title.lower())
+            score = min(1.0, (len(matched) + title_hits * 0.75) / max(4.0, len(terms) * 0.35))
+            scored.append({"knowledge_id": row["knowledge_id"], "title": title, "content": content, "version": row["version"], "score": round(score, 3), "matched_terms": matched[:12]})
+        return sorted(scored, key=lambda item: (item["score"], item["version"]), reverse=True)[:limit]
+    def retrieve(self, tenant_id, message):
+        return [item["content"] for item in self.retrieve_context(tenant_id, message)]
     def memories(self, tenant_id, customer_id): return [r["content"] for r in self.db.query("SELECT content FROM memories WHERE tenant_id=? AND customer_id=? AND status='approved' ORDER BY updated_at DESC LIMIT 8", (tenant_id, customer_id))]
     def extract_memories(self, tenant_id, customer_id, message, consent, source_message_id):
         if not consent: return
@@ -191,14 +205,16 @@ class CustomerService:
         intent, confidence, _ = self.classify_intent(message); direct = list(self._knowledge(tenant_id, intent)) if intent else []
         if direct and intent in {"price", "address", "hours", "services", "precautions"}:
             prefix = {"services": "目前门店提供：", "precautions": "根据门店护理说明："}.get(intent, "根据门店已发布资料："); return (prefix + " ".join(r["content"] for r in direct[:3]), confidence, False, None, "knowledge_direct", intent)
+        if intent == "hours" and store["business_hours"]:
+            return (f"门店营业时间为：{store['business_hours']}。如需预约，我可以帮您登记预约意向。", confidence, False, None, "knowledge_direct", intent)
         if direct and intent == "appointment": return ("可以帮您登记预约意向。请提供期望日期/时段、称呼和手机号，门店确认后才算预约成功。", 0.94, False, None, "knowledge_direct", intent)
-        docs = self.retrieve(tenant_id, message); memories = self.memories(tenant_id, customer_id); system = f"你是{store['name']}的专业美容院在线客服。客户意图：{intent or 'general_consultation'}。\n门店资料（仅可作为事实依据）：{' | '.join(docs) or '暂无直接匹配'}\n已确认客户偏好：{' | '.join(memories) or '暂无'}\n资料没有覆盖的项目、价格、时间、政策不得编造；可以提供保守的一般护理建议。涉及健康风险时建议人工评估，回答简洁友好。"
+        context = self.retrieve_context(tenant_id, message); docs = [item["content"] for item in context]; memories = self.memories(tenant_id, customer_id); system = f"你是{store['name']}的专业美容院在线客服。客户意图：{intent or 'general_consultation'}。\n门店资料（仅可作为事实依据）：{' | '.join(docs) or '暂无直接匹配'}\n已确认客户偏好：{' | '.join(memories) or '暂无'}\n资料没有覆盖的项目、价格、时间、政策不得编造；可以提供保守的一般护理建议。涉及健康风险时建议人工评估，回答简洁友好。"
         try:
             llm_reply = self.llm.complete_with_context(system, message, tenant_id=tenant_id, conversation_id=conversation_id, intent=intent, knowledge_context=docs, memories=memories)
         except TypeError:
             # Keep compatibility with simple test doubles and local adapters.
             llm_reply = self.llm.complete(system, message)
-        if llm_reply: return (llm_reply.rstrip() + self.CLINICAL_NOTICE, 0.78, False, None, "model_assisted", intent)
+        if llm_reply: return (llm_reply.rstrip() + self.CLINICAL_NOTICE, max(0.55, min(0.9, context[0]["score"] if context else 0.55)), False, None, "model_assisted", intent)
         status = self.llm.last_status; return ("这个问题门店资料暂未覆盖，我已为您登记并转人工确认，稍后会有工作人员回复。", 0.35, True, f"AI分析服务不可用（{status.get('error_category') or status.get('outcome')}）且资料不足", "handoff_fallback", intent)
     def chat(self, body):
         tenant_id = str(body.get("tenant_id") or TENANT_DEFAULT); message = str(body.get("message") or "").strip()
