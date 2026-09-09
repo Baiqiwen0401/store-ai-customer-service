@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from ai_gateway import DifyWorkflowClient
 
 ROOT = Path(__file__).parent
+KNOWLEDGE_SEED_PATH = ROOT / "knowledge_seed.json"
 ENVIRONMENT = os.getenv("STORE_AI_ENV", "development").strip().lower()
 DB_PATH = Path(os.getenv("STORE_AI_DB_PATH", str(ROOT / "runtime" / "store-ai.sqlite3")))
 HOST = os.getenv("STORE_AI_HOST", "127.0.0.1")
@@ -88,10 +89,26 @@ class StoreDB:
                 self.execute("DELETE FROM knowledge WHERE tenant_id=?", (TENANT_DEFAULT,))
             else:
                 self._repair_knowledge_metadata()
+                self._ensure_common_knowledge()
                 return
         ts = now(); self.execute("INSERT INTO stores(tenant_id,name,business_hours,address,phone,welcome_message,settings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (TENANT_DEFAULT, "悦己美容院", "10:00-21:00", "杭州市西湖区示例路 88 号", "0571-88888888", "您好，我是悦己美容院 AI 客服，很高兴为您服务。", "{}", ts, ts))
         docs = [("项目价格", "基础补水护理 198 元；深层清洁 268 元；敏感肌舒缓护理 298 元。单次护理约 60 分钟。", "pricing", "price"), ("门店项目", "目前提供基础补水护理、深层清洁、敏感肌舒缓护理。具体适用情况到店前可由美容师评估。", "services", "services"), ("营业与预约", "营业时间为每天 10:00-21:00。AI 仅登记预约意向，门店确认后才算预约成功。", "booking", "appointment"), ("护理注意事项", "如有红肿、破损、明显过敏、孕期或正在接受皮肤治疗，请先由美容师评估。", "safety", "precautions"), ("门店地址", "地址：杭州市西湖区示例路 88 号。电话：0571-88888888。", "store", "address"), ("服务边界", "不承诺根治、永久有效或百分百效果；涉及疾病、过敏、医美注射、退款、投诉或纠纷请转人工。", "safety", "risk")]
         for title, content, category, intent in docs: self.execute("INSERT INTO knowledge(tenant_id,title,content,category,intent,status,version,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (TENANT_DEFAULT, title, content, category, intent, "published", 1, "seed", ts, ts))
+        self._ensure_common_knowledge()
+
+    def _ensure_common_knowledge(self):
+        if TENANT_DEFAULT != "demo-beauty" or not KNOWLEDGE_SEED_PATH.exists():
+            return
+        try:
+            entries = json.loads(KNOWLEDGE_SEED_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOGGER.exception("common knowledge seed could not be loaded")
+            return
+        ts = now()
+        for entry in entries:
+            if self.one("SELECT knowledge_id FROM knowledge WHERE tenant_id=? AND title=?", (TENANT_DEFAULT, entry["title"])):
+                continue
+            self.execute("INSERT INTO knowledge(tenant_id,title,content,category,intent,status,version,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (TENANT_DEFAULT, entry["title"], entry["content"], entry.get("category", "general"), entry.get("intent"), "published", 1, entry.get("source", "market_faq_reviewed"), ts, ts))
 
     def _repair_knowledge_metadata(self):
         """Backfill intent/category for databases created by the first MVP."""
@@ -139,10 +156,10 @@ class LLMClient:
         if self.db: self.db.execute("INSERT INTO model_events(tenant_id,conversation_id,model,outcome,http_status,latency_ms,error_category,error_message,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (tenant_id, conversation_id, model or self.model, outcome, status, latency, category, message, now()))
 
 class CustomerService:
-    RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|百分百|100%|副作用")
+    RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|百分百|100%|副作用|系统提示词|提示词|客户手机号|泄露密码|验证码")
     APPOINT_RE = re.compile(r"预约|预定|有时间|有空|安排|周[一二三四五六日天]|上午|下午|晚上")
     BUDGET_RE = re.compile(r"预算[^0-9]{0,5}(\d{2,5})\s*元?"); TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
-    INTENT_RULES = {"packages": ("套餐", "套卡", "组合项目", "优惠套餐"), "price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议")}
+    INTENT_RULES = {"packages": ("套餐", "套卡", "组合项目", "优惠套餐", "会员卡"), "promotion": ("优惠", "活动", "团购", "赠送", "折扣"), "price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "duration": ("多久", "多长时间", "几分钟", "时长"), "first_visit": ("第一次", "首次到店", "第一次来", "初次"), "suitability": ("适合我吗", "适不适合", "能不能做", "可以做吗"), "cancellation": ("改期", "取消预约", "改预约", "迟到"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议"), "preparation": ("护理前", "做之前", "之前要准备", "护理前准备"), "aftercare": ("护理后", "做完之后", "做完注意", "术后护理"), "results": ("有效果吗", "效果怎么样", "多久见效", "能改善吗"), "payment": ("怎么付款", "付款方式", "支持什么支付", "发票"), "privacy": ("隐私", "手机号", "个人信息", "删除信息")}
     CLINICAL_NOTICE = "\n\nAI回复不作为治疗依据，建议转人工评估。"
     def __init__(self, db): self.db = db; self.llm = LLMClient(db)
     @classmethod
@@ -203,7 +220,7 @@ class CustomerService:
         store = self.db.one("SELECT * FROM stores WHERE tenant_id=?", (tenant_id,)); risk = self.RISK_RE.search(message)
         if risk: return ("这个情况需要由门店工作人员进一步了解后给您建议。为了安全起见，我先为您转接人工客服，请稍候。", 0.99, True, f"触发风险词：{risk.group(0)}", "risk_handoff", "risk")
         intent, confidence, _ = self.classify_intent(message); direct = list(self._knowledge(tenant_id, intent)) if intent else []
-        if direct and intent in {"packages", "price", "address", "hours", "services", "precautions"}:
+        if direct and intent in {"packages", "promotion", "price", "address", "hours", "services", "duration", "first_visit", "suitability", "preparation", "aftercare", "results", "cancellation", "payment", "privacy", "precautions"}:
             prefix = {"services": "目前门店提供：", "precautions": "根据门店护理说明："}.get(intent, "根据门店已发布资料："); return (prefix + " ".join(r["content"] for r in direct[:3]), confidence, False, None, "knowledge_direct", intent)
         if intent == "hours" and store["business_hours"]:
             return (f"门店营业时间为：{store['business_hours']}。如需预约，我可以帮您登记预约意向。", confidence, False, None, "knowledge_direct", intent)

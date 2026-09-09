@@ -1,0 +1,86 @@
+[
+  {
+    "title": "套餐与会员说明",
+    "content": "套餐、次卡和会员活动以门店当前已发布的项目组合、价格、有效期和使用规则为准。资料未明确时，AI 不会自行承诺套餐内容；可以继续登记客户想了解的项目组合、价格或有效期，由门店确认。",
+    "category": "packages",
+    "intent": "packages",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "预约流程与确认",
+    "content": "AI 只能登记预约意向，需要收集期望日期/时段、称呼、手机号和意向项目；门店工作人员确认时间后才算预约成功。未确认前不代表已锁定名额。",
+    "category": "booking",
+    "intent": "appointment",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "项目时长咨询",
+    "content": "不同项目的服务时长可能不同，具体以门店项目资料和当天安排为准。客户可以先询问具体项目，AI 只会引用已发布时长，不会自行估算或承诺结束时间。",
+    "category": "services",
+    "intent": "duration",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "首次到店流程",
+    "content": "首次到店通常需要先确认预约信息，再由工作人员了解客户需求和皮肤状态，最后确认适合的服务项目。涉及敏感、红肿、破损或正在接受皮肤治疗的情况，应先由工作人员评估。",
+    "category": "booking",
+    "intent": "first_visit",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "项目是否适合咨询",
+    "content": "项目是否适合个人情况不能仅凭线上文字确定。客户可以说明关注的问题、既往过敏情况和当前皮肤状态，门店工作人员会在服务前评估；AI 不进行疾病诊断或疗效判断。",
+    "category": "safety",
+    "intent": "suitability",
+    "source": "aad_skin_care_basics_2026"
+  },
+  {
+    "title": "护理前准备",
+    "content": "护理前请如实告知近期皮肤不适、过敏史、正在使用的护肤或治疗产品，以及孕期等可能影响服务安排的情况。不要隐瞒重要健康信息；具体准备事项以门店工作人员说明为准。",
+    "category": "safety",
+    "intent": "preparation",
+    "source": "aad_skin_care_basics_2026"
+  },
+  {
+    "title": "护理后注意事项",
+    "content": "护理后如出现明显不适、持续红肿、疼痛或其他异常，应停止自行处理并及时联系门店；必要时寻求合格医疗专业人员帮助。AI 不提供治疗方案，也不承诺护理效果。",
+    "category": "safety",
+    "intent": "aftercare",
+    "source": "aad_skin_care_basics_2026"
+  },
+  {
+    "title": "效果与疗程说明",
+    "content": "护理效果会因个人皮肤状态、生活习惯和项目内容而不同，不能承诺根治、永久有效或百分百效果。是否需要多次服务应由门店工作人员根据实际情况说明。",
+    "category": "safety",
+    "intent": "results",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "改期与取消预约",
+    "content": "改期、取消和迟到处理以门店已发布的预约政策为准。AI 不会自行承诺退款、补偿或保留名额；如果客户提供预约信息，门店工作人员可以进一步确认。",
+    "category": "booking",
+    "intent": "cancellation",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "优惠活动说明",
+    "content": "优惠、团购、赠送项目和活动有效期以门店当前发布内容为准。AI 不会自行生成优惠金额、使用条件或截止日期；未找到明确资料时会请门店确认。",
+    "category": "packages",
+    "intent": "promotion",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "付款方式说明",
+    "content": "付款方式、定金、发票和会员余额规则以门店当前政策为准。资料未明确时，AI 不会猜测收款方式或承诺退款，请转门店工作人员确认。",
+    "category": "policy",
+    "intent": "payment",
+    "source": "market_faq_reviewed"
+  },
+  {
+    "title": "隐私与客户信息",
+    "content": "客户可以匿名咨询；只有在客户同意并确有服务需要时，门店才保存必要的称呼、手机号或服务偏好。请不要在聊天中发送身份证、银行卡、验证码等无关敏感信息。",
+    "category": "privacy",
+    "intent": "privacy",
+    "source": "market_faq_reviewed"
+  }
+]
