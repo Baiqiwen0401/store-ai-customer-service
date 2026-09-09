@@ -52,9 +52,20 @@ docker compose up --build
 
 ```powershell
 python -m unittest -v
+python run_eval.py
 ```
 
-当前自动化回归覆盖知识直答、项目总览、风险转人工、预约待办去重、记忆同意与审核、模型辅助安全话术和注意事项咨询。
+`run_eval.py` 使用 `eval_cases.json` 执行本地试用基线，当前覆盖 31 条项目、价格、地址、营业时间、预约、风险和资料外问题。
+
+## 本机试用
+
+```powershell
+$env:STORE_AI_ENV = "development"
+$env:STORE_AI_PORT = "8000"
+python app.py
+```
+
+打开 <http://127.0.0.1:8000>。不配置模型密钥也可以试用结构化知识直答、预约意向、人工接管、知识草稿和记忆审核；复杂问题在没有模型配置时会进入人工兜底。配置 `LLM_*` 后可试用模型辅助回答，配置 `DIFY_*` 后可切换到 Dify Workflow。
 
 ## 开发续作
 
