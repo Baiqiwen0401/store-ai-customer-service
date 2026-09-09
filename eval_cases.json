@@ -3,6 +3,7 @@
   {"id":"service-02","message":"你们有什么护理服务？","mode":"knowledge_direct","contains":"基础补水护理"},
   {"id":"service-03","message":"做什么项目比较好？","mode":"knowledge_direct","contains":"敏感肌舒缓护理"},
   {"id":"service-04","message":"可以做哪些护理？","mode":"knowledge_direct","contains":"目前提供"},
+  {"id":"package-01","message":"有套餐吗？","mode":"package_clarification","contains":"项目组合"},
   {"id":"price-01","message":"深层清洁多少钱？","mode":"knowledge_direct","contains":"268"},
   {"id":"price-02","message":"基础补水护理收费多少？","mode":"knowledge_direct","contains":"198"},
   {"id":"price-03","message":"敏感肌舒缓护理价格？","mode":"knowledge_direct","contains":"298"},

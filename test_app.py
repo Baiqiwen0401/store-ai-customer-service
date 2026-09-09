@@ -70,6 +70,14 @@ class CustomerServiceTests(unittest.TestCase):
         self.assertEqual(result["reply_mode"], "knowledge_direct")
         self.assertIn("红肿", result["answer"])
 
+    def test_package_question_is_recognized_without_unnecessary_handoff(self):
+        result = self.service.chat({"message": "有套餐吗？"})
+        self.assertEqual(result["intent"], "packages")
+        self.assertEqual(result["reply_mode"], "package_clarification")
+        self.assertFalse(result["handoff"])
+        self.assertIsNone(result["task_id"])
+        self.assertIn("套餐", result["answer"])
+
 
 if __name__ == "__main__":
     unittest.main()

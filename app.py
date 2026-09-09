@@ -142,7 +142,7 @@ class CustomerService:
     RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|百分百|100%|副作用")
     APPOINT_RE = re.compile(r"预约|预定|有时间|有空|安排|周[一二三四五六日天]|上午|下午|晚上")
     BUDGET_RE = re.compile(r"预算[^0-9]{0,5}(\d{2,5})\s*元?"); TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
-    INTENT_RULES = {"price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议")}
+    INTENT_RULES = {"packages": ("套餐", "套卡", "组合项目", "优惠套餐"), "price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议")}
     CLINICAL_NOTICE = "\n\nAI回复不作为治疗依据，建议转人工评估。"
     def __init__(self, db): self.db = db; self.llm = LLMClient(db)
     @classmethod
@@ -203,10 +203,12 @@ class CustomerService:
         store = self.db.one("SELECT * FROM stores WHERE tenant_id=?", (tenant_id,)); risk = self.RISK_RE.search(message)
         if risk: return ("这个情况需要由门店工作人员进一步了解后给您建议。为了安全起见，我先为您转接人工客服，请稍候。", 0.99, True, f"触发风险词：{risk.group(0)}", "risk_handoff", "risk")
         intent, confidence, _ = self.classify_intent(message); direct = list(self._knowledge(tenant_id, intent)) if intent else []
-        if direct and intent in {"price", "address", "hours", "services", "precautions"}:
+        if direct and intent in {"packages", "price", "address", "hours", "services", "precautions"}:
             prefix = {"services": "目前门店提供：", "precautions": "根据门店护理说明："}.get(intent, "根据门店已发布资料："); return (prefix + " ".join(r["content"] for r in direct[:3]), confidence, False, None, "knowledge_direct", intent)
         if intent == "hours" and store["business_hours"]:
             return (f"门店营业时间为：{store['business_hours']}。如需预约，我可以帮您登记预约意向。", confidence, False, None, "knowledge_direct", intent)
+        if intent == "packages":
+            return ("您想了解套餐的项目组合、价格还是有效期？目前门店资料中还没有已发布的套餐详情，我先不替您猜测。", 0.88, False, None, "package_clarification", intent)
         if direct and intent == "appointment": return ("可以帮您登记预约意向。请提供期望日期/时段、称呼和手机号，门店确认后才算预约成功。", 0.94, False, None, "knowledge_direct", intent)
         context = self.retrieve_context(tenant_id, message); docs = [item["content"] for item in context]; memories = self.memories(tenant_id, customer_id); system = f"你是{store['name']}的专业美容院在线客服。客户意图：{intent or 'general_consultation'}。\n门店资料（仅可作为事实依据）：{' | '.join(docs) or '暂无直接匹配'}\n已确认客户偏好：{' | '.join(memories) or '暂无'}\n资料没有覆盖的项目、价格、时间、政策不得编造；可以提供保守的一般护理建议。涉及健康风险时建议人工评估，回答简洁友好。"
         try:
