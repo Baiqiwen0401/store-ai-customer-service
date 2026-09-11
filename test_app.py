@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import app
+from wechat_adapter import parse_message, verify_signature
 
 
 class CustomerServiceTests(unittest.TestCase):
@@ -27,6 +28,20 @@ class CustomerServiceTests(unittest.TestCase):
         self.assertFalse(result["handoff"])
         self.assertIn("深层清洁", result["answer"])
         self.assertNotIn("不得承诺", result["answer"])
+
+    def test_external_customer_id_reuses_customer(self):
+        first = self.service.chat({"message": "你们几点营业？", "channel": "wechat_official_account", "external_customer_id": "wechat:test-openid"})
+        second = self.service.chat({"message": "还有套餐吗？", "channel": "wechat_official_account", "external_customer_id": "wechat:test-openid"})
+        self.assertEqual(first["customer_id"], second["customer_id"])
+        self.assertEqual(len(self.db.query("SELECT * FROM customers")), 1)
+
+    def test_wechat_signature_and_text_xml(self):
+        import hashlib
+        token, timestamp, nonce = "token", "1700000000", "nonce"
+        signature = hashlib.sha1("".join(sorted((token, timestamp, nonce))).encode()).hexdigest()
+        self.assertTrue(verify_signature(token, signature, timestamp, nonce))
+        payload = "<xml><ToUserName><![CDATA[gh_store]]></ToUserName><FromUserName><![CDATA[openid]]></FromUserName><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[有套餐吗？]]></Content><MsgId>1</MsgId></xml>".encode()
+        self.assertEqual(parse_message(payload)["from_user"], "openid")
 
     def test_memory_is_candidate_until_approval(self):
         result = self.service.chat({"message": "我是敏感肌，周六下午想做补水，预算 300 元", "memory_consent": True})

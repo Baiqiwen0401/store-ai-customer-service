@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ai_gateway import DifyWorkflowClient
+from wechat_adapter import WeComGroupNotifier, parse_message, text_reply, verify_signature
 
 ROOT = Path(__file__).parent
 KNOWLEDGE_SEED_PATH = ROOT / "knowledge_seed.json"
@@ -51,7 +52,7 @@ def now() -> str:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS stores (tenant_id TEXT PRIMARY KEY, name TEXT NOT NULL, business_hours TEXT, address TEXT, phone TEXT, welcome_message TEXT, settings_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS customers (customer_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, name TEXT, phone TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(tenant_id, phone));
+CREATE TABLE IF NOT EXISTS customers (customer_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, external_id TEXT, name TEXT, phone TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(tenant_id, phone));
 CREATE TABLE IF NOT EXISTS consents (consent_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, customer_id INTEGER NOT NULL, consent_type TEXT NOT NULL, granted_at TEXT NOT NULL, revoked_at TEXT, UNIQUE(tenant_id, customer_id, consent_type));
 CREATE TABLE IF NOT EXISTS conversations (conversation_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, customer_id INTEGER, channel TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', handoff_reason TEXT, assigned_to TEXT, ai_enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (message_id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, confidence REAL, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
@@ -73,11 +74,12 @@ class StoreDB:
         with self.conn: self.conn.executescript(SCHEMA); self._migrate()
         self.seed()
     def _migrate(self):
-        additions = {"stores": {"settings_json": "TEXT NOT NULL DEFAULT '{}'", "created_at": "TEXT", "updated_at": "TEXT"}, "consents": {"revoked_at": "TEXT"}, "conversations": {"assigned_to": "TEXT", "ai_enabled": "INTEGER NOT NULL DEFAULT 1"}, "messages": {"metadata_json": "TEXT NOT NULL DEFAULT '{}'"}, "knowledge": {"category": "TEXT NOT NULL DEFAULT 'general'", "intent": "TEXT", "version": "INTEGER NOT NULL DEFAULT 1", "source": "TEXT NOT NULL DEFAULT 'manual'"}, "memories": {"source_message_id": "INTEGER", "reviewed_by": "TEXT", "reviewed_at": "TEXT"}, "tasks": {"due_at": "TEXT"}}
+        additions = {"stores": {"settings_json": "TEXT NOT NULL DEFAULT '{}'", "created_at": "TEXT", "updated_at": "TEXT"}, "customers": {"external_id": "TEXT"}, "consents": {"revoked_at": "TEXT"}, "conversations": {"assigned_to": "TEXT", "ai_enabled": "INTEGER NOT NULL DEFAULT 1"}, "messages": {"metadata_json": "TEXT NOT NULL DEFAULT '{}'"}, "knowledge": {"category": "TEXT NOT NULL DEFAULT 'general'", "intent": "TEXT", "version": "INTEGER NOT NULL DEFAULT 1", "source": "TEXT NOT NULL DEFAULT 'manual'"}, "memories": {"source_message_id": "INTEGER", "reviewed_by": "TEXT", "reviewed_at": "TEXT"}, "tasks": {"due_at": "TEXT"}}
         for table, cols in additions.items():
             have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             for name, spec in cols.items():
                 if name not in have: self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_external ON customers(tenant_id, external_id) WHERE external_id IS NOT NULL")
     def seed(self):
         existing = self.one("SELECT * FROM stores LIMIT 1")
         if existing:
@@ -157,7 +159,7 @@ class LLMClient:
 
 class CustomerService:
     RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|百分百|100%|副作用|系统提示词|提示词|客户手机号|泄露密码|验证码")
-    APPOINT_RE = re.compile(r"预约|预定|有时间|有空|安排|周[一二三四五六日天]|上午|下午|晚上")
+    APPOINT_RE = re.compile(r"预约|预定|预订|有时间|有空|安排|到店|周[一二三四五六日天]|今天|明天|后天|上午|下午|晚上|\d{1,2}\s*点")
     BUDGET_RE = re.compile(r"预算[^0-9]{0,5}(\d{2,5})\s*元?"); TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
     INTENT_RULES = {"packages": ("套餐", "套卡", "组合项目", "优惠套餐", "会员卡"), "promotion": ("优惠", "活动", "团购", "赠送", "折扣"), "price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "duration": ("多久", "多长时间", "几分钟", "时长"), "first_visit": ("第一次", "首次到店", "第一次来", "初次"), "suitability": ("适合我吗", "适不适合", "能不能做", "可以做吗"), "cancellation": ("改期", "取消预约", "改预约", "迟到"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议"), "preparation": ("护理前", "做之前", "之前要准备", "护理前准备"), "aftercare": ("护理后", "做完之后", "做完注意", "术后护理"), "results": ("有效果吗", "效果怎么样", "多久见效", "能改善吗"), "payment": ("怎么付款", "付款方式", "支持什么支付", "发票"), "privacy": ("隐私", "手机号", "个人信息", "删除信息")}
     CLINICAL_NOTICE = "\n\nAI回复不作为治疗依据，建议转人工评估。"
@@ -167,16 +169,21 @@ class CustomerService:
         for intent, phrases in cls.INTENT_RULES.items():
             if any(p in message for p in phrases): return intent, 0.97, "rule"
         return None, 0.0, "none"
-    def customer(self, tenant_id, customer_id, name, phone, consent):
+    def customer(self, tenant_id, customer_id, name, phone, consent, external_id=None):
         ts = now()
         if customer_id and self.db.one("SELECT customer_id FROM customers WHERE customer_id=? AND tenant_id=?", (customer_id, tenant_id)): return customer_id
+        if external_id:
+            row = self.db.one("SELECT customer_id FROM customers WHERE tenant_id=? AND external_id=?", (tenant_id, external_id))
+            if row:
+                if name: self.db.execute("UPDATE customers SET name=?,updated_at=? WHERE customer_id=?", (name, ts, row["customer_id"]))
+                return row["customer_id"]
         stored_phone = phone if consent and phone else None
         if stored_phone:
             row = self.db.one("SELECT customer_id FROM customers WHERE tenant_id=? AND phone=?", (tenant_id, stored_phone))
             if row:
                 if name: self.db.execute("UPDATE customers SET name=?,updated_at=? WHERE customer_id=?", (name, ts, row["customer_id"]))
                 return row["customer_id"]
-        cid = self.db.execute("INSERT INTO customers(tenant_id,name,phone,created_at,updated_at) VALUES(?,?,?,?,?)", (tenant_id, name, stored_phone, ts, ts))
+        cid = self.db.execute("INSERT INTO customers(tenant_id,external_id,name,phone,created_at,updated_at) VALUES(?,?,?,?,?,?)", (tenant_id, external_id, name, stored_phone, ts, ts))
         if consent: self.db.execute("INSERT OR IGNORE INTO consents(tenant_id,customer_id,consent_type,granted_at) VALUES(?,?,?,?)", (tenant_id, cid, "long_term_memory", ts))
         return cid
     def _knowledge(self, tenant_id, intent=None, published_only=True):
@@ -242,7 +249,7 @@ class CustomerService:
     def chat(self, body):
         tenant_id = str(body.get("tenant_id") or TENANT_DEFAULT); message = str(body.get("message") or "").strip()
         if not message: raise ValueError("message 不能为空")
-        consent = bool(body.get("memory_consent")); cid = self.customer(tenant_id, body.get("customer_id"), body.get("name"), body.get("phone"), consent); conversation_id = body.get("conversation_id")
+        consent = bool(body.get("memory_consent")); cid = self.customer(tenant_id, body.get("customer_id"), body.get("name"), body.get("phone"), consent, body.get("external_customer_id")); conversation_id = body.get("conversation_id")
         if conversation_id and not self.db.one("SELECT conversation_id FROM conversations WHERE conversation_id=? AND tenant_id=?", (conversation_id, tenant_id)): conversation_id = None
         if not conversation_id: conversation_id = self.db.execute("INSERT INTO conversations(tenant_id,customer_id,channel,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", (tenant_id, cid, body.get("channel", "web"), "open", now(), now()))
         conv = self.db.one("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)); message_id = self.db.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", (conversation_id, "user", message, now())); self.extract_memories(tenant_id, cid, message, consent, message_id)
@@ -251,11 +258,16 @@ class CustomerService:
         answer, confidence, handoff, reason, mode, intent = self.reply(tenant_id, cid, conversation_id, message); self.db.execute("INSERT INTO messages(conversation_id,role,content,confidence,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (conversation_id, "assistant", answer, confidence, json.dumps({"mode": mode, "intent": intent}, ensure_ascii=False), now()))
         if handoff: self.db.execute("UPDATE conversations SET status='handoff',handoff_reason=?,ai_enabled=0,updated_at=? WHERE conversation_id=?", (reason, now(), conversation_id))
         else: self.db.execute("UPDATE conversations SET updated_at=? WHERE conversation_id=?", (now(), conversation_id))
-        task_type = "handoff" if handoff else ("appointment_lead" if self.APPOINT_RE.search(message) else None); task_id = None
+        task_type = "handoff" if handoff else ("appointment_lead" if self.APPOINT_RE.search(message) else None); task_id = None; task_created = False
         if task_type:
             existing = self.db.one("SELECT task_id FROM tasks WHERE conversation_id=? AND task_type=? AND status='pending'", (conversation_id, task_type))
             if existing: task_id = existing["task_id"]
-            else: task_id = self.db.execute("INSERT INTO tasks(tenant_id,customer_id,conversation_id,task_type,summary,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (tenant_id, cid, conversation_id, task_type, (f"需人工接管：{reason}" if handoff else "客户咨询预约意向") + f"。客户问题：{message[:120]}", "pending", now(), now()))
+            else:
+                task_id = self.db.execute("INSERT INTO tasks(tenant_id,customer_id,conversation_id,task_type,summary,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (tenant_id, cid, conversation_id, task_type, (f"需人工接管：{reason}" if handoff else "客户咨询预约意向") + f"。客户问题：{message[:120]}", "pending", now(), now()))
+                task_created = True
+        if task_created and task_type == "appointment_lead":
+            summary = f"待办编号：{task_id}\n客户问题：{message[:240]}\n会话编号：{conversation_id}"
+            threading.Thread(target=WeComGroupNotifier.from_env().send_appointment, args=(summary,), daemon=True).start()
         return {"conversation_id": conversation_id, "customer_id": cid, "answer": answer, "confidence": confidence, "handoff": handoff, "handoff_reason": reason, "task_id": task_id, "intent": intent, "reply_mode": mode, "model_status": self.llm.last_status}
 
 DB = StoreDB(); SERVICE = CustomerService(DB)
@@ -336,6 +348,16 @@ class Handler(BaseHTTPRequestHandler):
                 healthy = database_ok
                 self.send_json({"status": "ok" if healthy else "degraded", "environment": ENVIRONMENT, "database": "ok" if database_ok else "error", "model_configured": bool(SERVICE.llm.key)})
                 return
+            if path == "/wechat/callback":
+                query = parse_qs(urlparse(self.path).query)
+                token = os.getenv("WECHAT_CALLBACK_TOKEN", "")
+                signature = query.get("signature", [""])[0]
+                timestamp = query.get("timestamp", [""])[0]
+                nonce = query.get("nonce", [""])[0]
+                if not verify_signature(token, signature, timestamp, nonce):
+                    self.send_response(403); self.end_headers(); return
+                data = query.get("echostr", [""])[0].encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
             protected_get = (
                 path == "/api/model-status"
                 or path in {"/api/customers", "/api/tasks", "/api/conversations", "/api/memories", "/api/knowledge", "/api/audit"}
@@ -371,6 +393,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if path == "/wechat/callback":
+                query = parse_qs(urlparse(self.path).query)
+                token = os.getenv("WECHAT_CALLBACK_TOKEN", "")
+                if not verify_signature(token, query.get("signature", [""])[0], query.get("timestamp", [""])[0], query.get("nonce", [""])[0]):
+                    self.send_response(403); self.end_headers(); return
+                try:
+                    length = min(int(self.headers.get("Content-Length", "0")), MAX_BODY_BYTES)
+                    message = parse_message(self.rfile.read(length))
+                except (ValueError, OSError):
+                    message = None
+                if not message:
+                    self.send_response(204); self.end_headers(); return
+                result = SERVICE.chat({"tenant_id": TENANT_DEFAULT, "channel": "wechat_official_account", "external_customer_id": f"wechat:{message['from_user']}", "message": message["content"]})
+                data = text_reply(message["from_user"], message["to_user"], result["answer"])
+                self.send_response(200); self.send_header("Content-Type", "application/xml; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
             body = self.body(); tenant = self.tenant(body)
             if path == "/api/chat": self.send_json(SERVICE.chat(body)); return
             if not self.staff_ok(): self.send_json({"error": "需要门店工作台权限"}, 401); return

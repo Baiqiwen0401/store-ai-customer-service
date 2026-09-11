@@ -1,6 +1,6 @@
 # 个体门店 AI 客服
 
-面向美容院等个体门店的本地优先 AI 客服。当前版本只接入网页客服，支持意图识别、已发布知识直答、复杂问题模型辅助、预约意向待办、人工接管、客户长期记忆审核和模型诊断。
+面向美容院等个体门店的本地优先 AI 客服。当前版本支持网页客服和微信公众号文本回调，支持意图识别、已发布知识直答、复杂问题模型辅助、预约意向待办、企业微信群通知、人工接管、客户长期记忆审核和模型诊断。
 
 生产级方案与实施进度见 `个体门店AI客服生产级技术方案_v2.0.docx` 和 `PROJECT_PROGRESS.md`。新会话或新成员开始工作前，应先读取 `PROJECT_PROGRESS.md`，按照阶段状态继续，不重复已经完成的工作。
 
@@ -19,7 +19,7 @@ python app.py
 
 生产环境还必须设置 `STORE_AI_ENV=production`、`STAFF_ACCESS_KEY` 和明确的 `STORE_AI_ALLOWED_ORIGINS`。当前 SQLite 仅用于本地试用，生产数据迁移到 PostgreSQL 前不得承载关键真实业务。
 
-可选配置 `DIFY_BASE_URL` 与 `DIFY_API_KEY` 后，复杂问题会通过 Dify Workflow API 处理；门店项目、价格、地址和营业时间等结构化直答仍由业务后端优先处理。Dify 未配置时继续使用 `LLM_*` 的 OpenAI-compatible 模型调用。
+可选配置 `DIFY_BASE_URL` 与 `DIFY_API_KEY` 后，复杂问题会通过 Dify Workflow API 处理；门店项目、价格、地址和营业时间等结构化直答仍由业务后端优先处理。Dify 未配置时继续使用 `LLM_*` 的 OpenAI-compatible 模型调用。配置 `WECHAT_INTERNAL_GROUP_WEBHOOK` 后，新建预约意向会异步发送到企业微信群机器人。
 
 数据默认保存在 `runtime/store-ai.sqlite3`，该目录已加入 `.gitignore`。Docker 启动：
 
@@ -38,6 +38,7 @@ docker compose up --build
 ## 接口
 
 - `POST /api/chat`：网页会话、意图识别、回答、预约意向和人工接管。
+- `GET|POST /wechat/callback`：微信公众号服务器回调校验和文本消息自动回复；需配置 `WECHAT_CALLBACK_TOKEN`。
 - `GET /api/conversations`、`GET /api/conversations/{id}`：会话列表和完整消息。
 - `POST /api/conversations/{id}/claim|reply|resume|close`：人工工作流。
 - `GET /api/model-status`：最近模型调用状态、耗时和错误类别，不返回密钥。
@@ -55,7 +56,7 @@ python -m unittest -v
 python run_eval.py
 ```
 
-`run_eval.py` 使用 `eval_cases.json` 执行本地试用基线，当前覆盖 31 条项目、价格、地址、营业时间、预约、风险和资料外问题。
+`run_eval.py` 使用 `eval_cases.json` 执行本地试用基线，当前覆盖项目、价格、地址、营业时间、预约、风险和资料外问题；微信回调签名、XML 解析和外部客户映射由单元测试覆盖。
 
 ## 本机试用
 
