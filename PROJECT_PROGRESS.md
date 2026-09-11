@@ -128,6 +128,7 @@
 - 已提交并推送 FAQ 检索聚焦修复：`c28557c` 已推送到 `origin/feature_v1`。
 - 需求收敛为微信自动回复和预约信息同步内部群；新增 `wechat_adapter.py`、`/wechat/callback`、企业微信群机器人通知和 `external_id` 客户映射。
 - 已在本机用户环境配置大模型中转站和 `gpt-5.6-sol`，未将密钥写入文件、日志或 Git。
+- 已提交并推送微信自动回复阶段：`474fb04` 已推送到 `origin/feature_v1`。
 - 已提交并推送阶段 1：合并提交 `3d094e9` 已推送到 `origin/feature_v1`；该提交同时保留了远程分支原有历史。
 
 ## GitHub 阶段推送规范
