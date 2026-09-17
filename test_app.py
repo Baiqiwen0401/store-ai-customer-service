@@ -334,15 +334,27 @@ class NotificationOutboxTests(unittest.TestCase):
         self.assertEqual(sent["attempt_count"], 2)
         self.assertEqual(len(notifier.calls), 2)
 
-    def test_customer_service_enqueues_one_notification_per_appointment_task(self):
+    def test_customer_service_does_not_notify_for_unrelated_follow_up(self):
         notifier = StubNotifier([True])
         outbox = app.NotificationOutbox(self.db, notifier)
         service = app.CustomerService(self.db, outbox)
         first = service.chat({"message": "周六下午可以预约吗？", "channel": "wecom_kf", "external_customer_id": "wecom_kf:test"})
-        service.chat({"message": "我想预约补水", "channel": "wecom_kf", "external_customer_id": "wecom_kf:test"})
+        service.chat({"message": "好的，谢谢", "channel": "wecom_kf", "external_customer_id": "wecom_kf:test"})
         rows = self.db.query("SELECT * FROM notification_outbox")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["dedupe_key"], f"appointment:{first['task_id']}")
+        self.assertEqual(rows[0]["dedupe_key"], f"appointment:{first['task_id']}:initial")
+
+    def test_appointment_follow_up_updates_task_and_enqueues_revision(self):
+        notifier = StubNotifier([True, True])
+        outbox = app.NotificationOutbox(self.db, notifier)
+        service = app.CustomerService(self.db, outbox)
+        first = service.chat({"message": "我想预约护理", "channel": "wecom_kf", "external_customer_id": "wecom_kf:followup"})
+        service.chat({"message": "明天下午，我叫小王，手机号 13812345678", "channel": "wecom_kf", "external_customer_id": "wecom_kf:followup"})
+        task = self.db.one("SELECT * FROM tasks WHERE task_id=?", (first["task_id"],))
+        self.assertIn("补充信息", task["summary"])
+        rows = self.db.query("SELECT * FROM notification_outbox ORDER BY notification_id")
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[1]["dedupe_key"].startswith(f"appointment:{first['task_id']}:") and rows[1]["dedupe_key"] != rows[0]["dedupe_key"])
 
 
 if __name__ == "__main__":

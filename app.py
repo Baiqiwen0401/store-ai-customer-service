@@ -211,6 +211,7 @@ class LLMClient:
 class CustomerService:
     RISK_RE = re.compile(r"过敏|红肿|破损|疾病|孕期|怀孕|医美|注射|退款|投诉|纠纷|根治|永久|保证有效|百分百|100%|副作用|系统提示词|提示词|客户手机号|泄露密码|验证码")
     APPOINT_RE = re.compile(r"预约|预定|预订|有时间|有空|安排|到店|周[一二三四五六日天]|今天|明天|后天|上午|下午|晚上|\d{1,2}\s*点")
+    APPOINT_DETAIL_RE = re.compile(r"(?:1[3-9]\d{9})|(?:我叫|姓名|称呼)|周[一二三四五六日天]|今天|明天|后天|上午|下午|晚上|\d{1,2}\s*点|补水|清洁|舒缓|护理|项目")
     BUDGET_RE = re.compile(r"预算[^0-9]{0,5}(\d{2,5})\s*元?"); TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
     INTENT_RULES = {"packages": ("套餐", "套卡", "组合项目", "优惠套餐", "会员卡"), "promotion": ("优惠", "活动", "团购", "赠送", "折扣"), "price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "duration": ("多久", "多长时间", "几分钟", "时长"), "first_visit": ("第一次", "首次到店", "第一次来", "初次"), "suitability": ("适合我吗", "适不适合", "能不能做", "可以做吗"), "cancellation": ("改期", "取消预约", "改预约", "迟到"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议"), "preparation": ("护理前", "做之前", "之前要准备", "护理前准备"), "aftercare": ("护理后", "做完之后", "做完注意", "术后护理"), "results": ("有效果吗", "效果怎么样", "多久见效", "能改善吗"), "payment": ("怎么付款", "付款方式", "支持什么支付", "发票"), "privacy": ("隐私", "手机号", "个人信息", "删除信息")}
     CLINICAL_NOTICE = "\n\nAI回复不作为治疗依据，建议转人工评估。"
@@ -309,13 +310,23 @@ class CustomerService:
         conv = self.db.one("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)); message_id = self.db.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", (conversation_id, "user", message, now())); self.extract_memories(tenant_id, cid, message, consent, message_id)
         if conv["ai_enabled"] == 0 or conv["status"] in {"human", "closed"}:
             answer = "已收到您的消息，门店人工客服会在工作台中继续跟进。" if conv["status"] != "closed" else "本次会话已结束，如需继续咨询请重新发起会话。"; self.db.execute("INSERT INTO messages(conversation_id,role,content,confidence,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (conversation_id, "assistant", answer, 1.0, json.dumps({"mode": "human_waiting"}, ensure_ascii=False), now())); return {"conversation_id": conversation_id, "customer_id": cid, "answer": answer, "confidence": 1.0, "handoff": conv["status"] != "closed", "reply_mode": "human_waiting", "intent": None, "task_id": None}
-        answer, confidence, handoff, reason, mode, intent = self.reply(tenant_id, cid, conversation_id, message); self.db.execute("INSERT INTO messages(conversation_id,role,content,confidence,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (conversation_id, "assistant", answer, confidence, json.dumps({"mode": mode, "intent": intent}, ensure_ascii=False), now()))
+        pending_appointment = self.db.one("SELECT * FROM tasks WHERE conversation_id=? AND task_type='appointment_lead' AND status='pending'", (conversation_id,))
+        appointment_update = bool(pending_appointment and self.APPOINT_DETAIL_RE.search(message))
+        if appointment_update:
+            answer, confidence, handoff, reason, mode, intent = ("已补充登记您的预约信息，门店工作人员会结合前面的内容确认具体时间。", 0.98, False, None, "appointment_update", "appointment")
+        else:
+            answer, confidence, handoff, reason, mode, intent = self.reply(tenant_id, cid, conversation_id, message)
+        self.db.execute("INSERT INTO messages(conversation_id,role,content,confidence,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (conversation_id, "assistant", answer, confidence, json.dumps({"mode": mode, "intent": intent}, ensure_ascii=False), now()))
         if handoff: self.db.execute("UPDATE conversations SET status='handoff',handoff_reason=?,ai_enabled=0,updated_at=? WHERE conversation_id=?", (reason, now(), conversation_id))
         else: self.db.execute("UPDATE conversations SET updated_at=? WHERE conversation_id=?", (now(), conversation_id))
-        task_type = "handoff" if handoff else ("appointment_lead" if self.APPOINT_RE.search(message) else None); task_id = None; task_created = False
+        task_type = "handoff" if handoff else ("appointment_lead" if self.APPOINT_RE.search(message) or appointment_update else None); task_id = None; task_created = False; task_updated = False
         if task_type:
             existing = self.db.one("SELECT task_id FROM tasks WHERE conversation_id=? AND task_type=? AND status='pending'", (conversation_id, task_type))
-            if existing: task_id = existing["task_id"]
+            if existing:
+                task_id = existing["task_id"]
+                if task_type == "appointment_lead" and appointment_update:
+                    self.db.execute("UPDATE tasks SET summary=summary||?,updated_at=? WHERE task_id=?", (f"\n补充信息：{message[:120]}", now(), task_id))
+                    task_updated = True
             else:
                 task_id = self.db.execute("INSERT INTO tasks(tenant_id,customer_id,conversation_id,task_type,summary,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (tenant_id, cid, conversation_id, task_type, (f"需人工接管：{reason}" if handoff else "客户咨询预约意向") + f"。客户问题：{message[:120]}", "pending", now(), now()))
                 task_created = True
@@ -325,6 +336,9 @@ class CustomerService:
                 self.notification_outbox.enqueue_appointment(tenant_id, task_id, summary)
             else:
                 threading.Thread(target=WeComGroupNotifier.from_env().send_appointment, args=(summary,), daemon=True).start()
+        elif task_updated and task_type == "appointment_lead" and self.notification_outbox:
+            summary = f"预约信息更新\n待办编号：{task_id}\n补充内容：{message[:240]}\n会话编号：{conversation_id}"
+            self.notification_outbox.enqueue_appointment(tenant_id, task_id, summary, revision=str(message_id))
         return {"conversation_id": conversation_id, "customer_id": cid, "answer": answer, "confidence": confidence, "handoff": handoff, "handoff_reason": reason, "task_id": task_id, "intent": intent, "reply_mode": mode, "model_status": self.llm.last_status}
 
 
@@ -340,11 +354,11 @@ class NotificationOutbox:
         self.stop_event = threading.Event()
         self.thread = None
 
-    def enqueue_appointment(self, tenant_id, task_id, summary):
+    def enqueue_appointment(self, tenant_id, task_id, summary, revision="initial"):
         ts = now()
         self.db.execute(
             "INSERT OR IGNORE INTO notification_outbox(tenant_id,channel,dedupe_key,payload,status,attempt_count,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (tenant_id, "wecom_group", f"appointment:{task_id}", summary, "pending", 0, ts, ts, ts),
+            (tenant_id, "wecom_group", f"appointment:{task_id}:{revision}", summary, "pending", 0, ts, ts, ts),
         )
         self.wakeup.set()
 
