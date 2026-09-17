@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -18,7 +19,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ai_gateway import DifyWorkflowClient
-from wechat_adapter import WeComGroupNotifier, parse_message, text_reply, verify_signature
+from wechat_adapter import WeComAPI, WeComAPIError, WeComCrypto, WeComGroupNotifier, WeComProtocolError, parse_message, text_reply, verify_signature
 
 ROOT = Path(__file__).parent
 KNOWLEDGE_SEED_PATH = ROOT / "knowledge_seed.json"
@@ -43,12 +44,38 @@ def validate_startup_config() -> None:
         raise RuntimeError("生产环境必须配置 STORE_AI_ALLOWED_ORIGINS，禁止使用通配 CORS")
     if ENVIRONMENT == "production" and DB_PATH.suffix in {".db", ".sqlite", ".sqlite3"}:
         LOGGER.warning("生产环境当前仍使用 SQLite；阶段 2 完成前不应承载高并发或关键生产数据")
+    if ENVIRONMENT == "production":
+        required_wecom = {
+            "WECOM_CORP_ID": os.getenv("WECOM_CORP_ID", "").strip(),
+            "WECOM_APP_SECRET": os.getenv("WECOM_APP_SECRET", "").strip(),
+            "WECOM_CALLBACK_TOKEN": os.getenv("WECOM_CALLBACK_TOKEN", "").strip(),
+            "WECOM_CALLBACK_AES_KEY": os.getenv("WECOM_CALLBACK_AES_KEY", "").strip(),
+            "WECOM_KF_OPEN_ID": os.getenv("WECOM_KF_OPEN_ID", "").strip(),
+        }
+        missing = [name for name, value in required_wecom.items() if not value]
+        if missing:
+            raise RuntimeError(f"生产环境必须配置企业微信参数：{', '.join(missing)}")
+        if len(required_wecom["WECOM_CALLBACK_AES_KEY"]) != 43:
+            raise RuntimeError("生产环境 WECOM_CALLBACK_AES_KEY 必须为 43 位")
 
 
 validate_startup_config()
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def wecom_crypto_from_env() -> WeComCrypto:
+    """Build callback crypto only when all secrets are present in the process."""
+    return WeComCrypto(
+        os.getenv("WECOM_CALLBACK_TOKEN", "").strip(),
+        os.getenv("WECOM_CALLBACK_AES_KEY", "").strip(),
+        os.getenv("WECOM_CORP_ID", "").strip(),
+    )
+
+
+def wecom_callback_configured() -> bool:
+    return all(os.getenv(name, "").strip() for name in ("WECOM_CORP_ID", "WECOM_CALLBACK_TOKEN", "WECOM_CALLBACK_AES_KEY"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS stores (tenant_id TEXT PRIMARY KEY, name TEXT NOT NULL, business_hours TEXT, address TEXT, phone TEXT, welcome_message TEXT, settings_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -61,10 +88,13 @@ CREATE TABLE IF NOT EXISTS memories (memory_id INTEGER PRIMARY KEY AUTOINCREMENT
 CREATE TABLE IF NOT EXISTS tasks (task_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, customer_id INTEGER, conversation_id INTEGER, task_type TEXT NOT NULL, summary TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', assignee TEXT, due_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT, conversation_id INTEGER, model TEXT, outcome TEXT NOT NULL, http_status INTEGER, latency_ms INTEGER, error_category TEXT, error_message TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_log (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER, detail_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS channel_cursors (cursor_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, channel TEXT NOT NULL, account_id TEXT NOT NULL, cursor TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, UNIQUE(tenant_id, channel, account_id));
+CREATE TABLE IF NOT EXISTS channel_messages (channel_message_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, channel TEXT NOT NULL, external_msg_id TEXT NOT NULL, direction TEXT NOT NULL, external_customer_id TEXT, account_id TEXT NOT NULL, status TEXT NOT NULL, error_code TEXT, error_message TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(tenant_id, channel, external_msg_id, direction));
 CREATE INDEX IF NOT EXISTS idx_knowledge_tenant ON knowledge(tenant_id, status, intent);
 CREATE INDEX IF NOT EXISTS idx_memory_customer ON memories(tenant_id, customer_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_status ON channel_messages(tenant_id, channel, status, updated_at);
 """
 
 class StoreDB:
@@ -125,6 +155,22 @@ class StoreDB:
         rows = self.query(sql, args); return rows[0] if rows else None
     def execute(self, sql: str, args=()):
         with self.lock, self.conn: return self.conn.execute(sql, args).lastrowid
+    def claim_channel_message(self, tenant_id, channel, external_msg_id, direction, external_customer_id, account_id):
+        ts = now()
+        with self.lock, self.conn:
+            try:
+                self.conn.execute(
+                    "INSERT INTO channel_messages(tenant_id,channel,external_msg_id,direction,external_customer_id,account_id,status,attempt_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (tenant_id, channel, external_msg_id, direction, external_customer_id, account_id, "processing", 1, ts, ts),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+    def save_channel_cursor(self, tenant_id, channel, account_id, cursor):
+        self.execute(
+            "INSERT INTO channel_cursors(tenant_id,channel,account_id,cursor,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(tenant_id,channel,account_id) DO UPDATE SET cursor=excluded.cursor,updated_at=excluded.updated_at",
+            (tenant_id, channel, account_id, cursor, now()),
+        )
     def close(self):
         with self.lock: self.conn.close()
 
@@ -249,9 +295,12 @@ class CustomerService:
     def chat(self, body):
         tenant_id = str(body.get("tenant_id") or TENANT_DEFAULT); message = str(body.get("message") or "").strip()
         if not message: raise ValueError("message 不能为空")
-        consent = bool(body.get("memory_consent")); cid = self.customer(tenant_id, body.get("customer_id"), body.get("name"), body.get("phone"), consent, body.get("external_customer_id")); conversation_id = body.get("conversation_id")
+        consent = bool(body.get("memory_consent")); external_customer_id = body.get("external_customer_id"); channel = str(body.get("channel") or "web"); cid = self.customer(tenant_id, body.get("customer_id"), body.get("name"), body.get("phone"), consent, external_customer_id); conversation_id = body.get("conversation_id")
         if conversation_id and not self.db.one("SELECT conversation_id FROM conversations WHERE conversation_id=? AND tenant_id=?", (conversation_id, tenant_id)): conversation_id = None
-        if not conversation_id: conversation_id = self.db.execute("INSERT INTO conversations(tenant_id,customer_id,channel,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", (tenant_id, cid, body.get("channel", "web"), "open", now(), now()))
+        if not conversation_id and external_customer_id:
+            existing_conversation = self.db.one("SELECT conversation_id FROM conversations WHERE tenant_id=? AND customer_id=? AND channel=? AND status!='closed' ORDER BY updated_at DESC LIMIT 1", (tenant_id, cid, channel))
+            if existing_conversation: conversation_id = existing_conversation["conversation_id"]
+        if not conversation_id: conversation_id = self.db.execute("INSERT INTO conversations(tenant_id,customer_id,channel,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", (tenant_id, cid, channel, "open", now(), now()))
         conv = self.db.one("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)); message_id = self.db.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", (conversation_id, "user", message, now())); self.extract_memories(tenant_id, cid, message, consent, message_id)
         if conv["ai_enabled"] == 0 or conv["status"] in {"human", "closed"}:
             answer = "已收到您的消息，门店人工客服会在工作台中继续跟进。" if conv["status"] != "closed" else "本次会话已结束，如需继续咨询请重新发起会话。"; self.db.execute("INSERT INTO messages(conversation_id,role,content,confidence,metadata_json,created_at) VALUES(?,?,?,?,?,?)", (conversation_id, "assistant", answer, 1.0, json.dumps({"mode": "human_waiting"}, ensure_ascii=False), now())); return {"conversation_id": conversation_id, "customer_id": cid, "answer": answer, "confidence": 1.0, "handoff": conv["status"] != "closed", "reply_mode": "human_waiting", "intent": None, "task_id": None}
@@ -270,7 +319,150 @@ class CustomerService:
             threading.Thread(target=WeComGroupNotifier.from_env().send_appointment, args=(summary,), daemon=True).start()
         return {"conversation_id": conversation_id, "customer_id": cid, "answer": answer, "confidence": confidence, "handoff": handoff, "handoff_reason": reason, "task_id": task_id, "intent": intent, "reply_mode": mode, "model_status": self.llm.last_status}
 
+
+class WeComMessageProcessor:
+    """Pull, deduplicate, process and acknowledge WeChat Customer Service messages."""
+
+    channel = "wecom_kf"
+    unsupported_reply = "暂时只能处理文字消息，请将问题或预约信息用文字发送。"
+
+    def __init__(self, db, service, api=None, tenant_id=TENANT_DEFAULT):
+        self.db = db
+        self.service = service
+        self.api = api or WeComAPI.from_env()
+        self.tenant_id = tenant_id
+        self._account_locks = {}
+        self._locks_guard = threading.Lock()
+
+    def configured(self):
+        return self.api.configured and bool(os.getenv("WECOM_KF_OPEN_ID", "").strip())
+
+    def _account_lock(self, account_id):
+        with self._locks_guard:
+            return self._account_locks.setdefault(account_id, threading.Lock())
+
+    def _update_message(self, external_msg_id, direction, status, error_code=None, error_message=None):
+        self.db.execute(
+            "UPDATE channel_messages SET status=?,error_code=?,error_message=?,updated_at=? WHERE tenant_id=? AND channel=? AND external_msg_id=? AND direction=?",
+            (status, None if error_code is None else str(error_code), error_message, now(), self.tenant_id, self.channel, external_msg_id, direction),
+        )
+
+    @staticmethod
+    def _outbound_id(inbound_msgid):
+        digest = hashlib.sha256(inbound_msgid.encode("utf-8")).hexdigest()[:26]
+        return f"ai_{digest}"
+
+    def _record_send_failure(self, item):
+        event = item.get("event") or {}
+        failed_msgid = str(event.get("fail_msgid") or "")
+        if failed_msgid:
+            self._update_message(
+                failed_msgid,
+                "outgoing",
+                "failed",
+                event.get("fail_type", 0),
+                "企业微信报告消息最终发送失败",
+            )
+
+    def _process_item(self, item, account_id):
+        inbound_msgid = str(item.get("msgid") or "")
+        if not inbound_msgid:
+            # Events are not guaranteed to expose msgid; a canonical digest
+            # still makes callback retries idempotent without inventing a
+            # customer-visible identifier.
+            canonical = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            inbound_msgid = "event_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:26]
+        external_userid = str(item.get("external_userid") or (item.get("event") or {}).get("external_userid") or "")
+        if not self.db.claim_channel_message(self.tenant_id, self.channel, inbound_msgid, "incoming", external_userid, account_id):
+            return
+        try:
+            if item.get("msgtype") == "event":
+                if (item.get("event") or {}).get("event_type") == "msg_send_fail":
+                    self._record_send_failure(item)
+                self._update_message(inbound_msgid, "incoming", "processed")
+                return
+            try:
+                origin = int(item.get("origin", 0))
+            except (TypeError, ValueError):
+                origin = 0
+            if origin != 3:
+                self._update_message(inbound_msgid, "incoming", "ignored")
+                return
+            if not external_userid:
+                self._update_message(inbound_msgid, "incoming", "failed", "invalid_message", "缺少 external_userid")
+                return
+            if item.get("msgtype") == "text":
+                content = str((item.get("text") or {}).get("content") or "").strip()
+                if not content:
+                    self._update_message(inbound_msgid, "incoming", "ignored")
+                    return
+                result = self.service.chat({
+                    "tenant_id": self.tenant_id,
+                    "channel": self.channel,
+                    "external_customer_id": f"wecom_kf:{external_userid}",
+                    "message": content,
+                })
+                answer = result["answer"]
+            else:
+                answer = self.unsupported_reply
+            requested_msgid = self._outbound_id(inbound_msgid)
+            self.db.claim_channel_message(self.tenant_id, self.channel, requested_msgid, "outgoing", external_userid, account_id)
+            sent = self.api.send_text(external_userid, account_id, answer, requested_msgid)
+            sent_msgid = str(sent.get("msgid") or requested_msgid)
+            if sent_msgid != requested_msgid:
+                self.db.claim_channel_message(self.tenant_id, self.channel, sent_msgid, "outgoing", external_userid, account_id)
+            self._update_message(sent_msgid, "outgoing", "sent")
+            self._update_message(inbound_msgid, "incoming", "processed")
+        except WeComAPIError as exc:
+            if "requested_msgid" in locals():
+                self._update_message(requested_msgid, "outgoing", "failed", exc.code, exc.message)
+            self._update_message(inbound_msgid, "incoming", "failed", exc.code, exc.message)
+            LOGGER.warning("wecom message processing API failure: code=%s msgid=%s", exc.code, inbound_msgid)
+        except Exception as exc:
+            self._update_message(inbound_msgid, "incoming", "failed", "internal", str(exc)[:300])
+            LOGGER.exception("wecom message processing failed: msgid=%s", inbound_msgid)
+
+    def sync(self, callback_token, account_id):
+        if not callback_token or not account_id:
+            raise ValueError("企业微信回调缺少 Token 或 OpenKfId")
+        with self._account_lock(account_id):
+            row = self.db.one(
+                "SELECT cursor FROM channel_cursors WHERE tenant_id=? AND channel=? AND account_id=?",
+                (self.tenant_id, self.channel, account_id),
+            )
+            cursor = str(row["cursor"] if row else "")
+            for _ in range(100):
+                page = self.api.sync_messages(callback_token, account_id, cursor)
+                for item in page.get("msg_list") or []:
+                    self._process_item(item, account_id)
+                next_cursor = str(page.get("next_cursor") or cursor)
+                self.db.save_channel_cursor(self.tenant_id, self.channel, account_id, next_cursor)
+                if int(page.get("has_more", 0)) != 1:
+                    return
+                if next_cursor == cursor:
+                    raise WeComAPIError(-1, "sync_msg has_more=1 but cursor did not advance")
+                cursor = next_cursor
+            raise WeComAPIError(-1, "sync_msg exceeded 100 pages")
+
+    def handle_callback_event(self, event):
+        if event.get("Event") != "kf_msg_or_event":
+            return
+        account_id = str(event.get("OpenKfId") or os.getenv("WECOM_KF_OPEN_ID", "")).strip()
+        self.sync(str(event.get("Token") or ""), account_id)
+
 DB = StoreDB(); SERVICE = CustomerService(DB)
+WECOM_PROCESSOR = WeComMessageProcessor(DB, SERVICE)
+
+
+def _process_wecom_event(event):
+    try:
+        WECOM_PROCESSOR.handle_callback_event(event)
+    except Exception:
+        # Callback already returned success; retries are controlled by the
+        # persisted cursor and failed message status rather than HTTP retry.
+        LOGGER.exception("wecom callback event processing failed")
+
+
 def row_dict(row): return dict(row) if row else None
 
 
@@ -346,8 +538,24 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     LOGGER.exception("health database check failed")
                 healthy = database_ok
-                self.send_json({"status": "ok" if healthy else "degraded", "environment": ENVIRONMENT, "database": "ok" if database_ok else "error", "model_configured": bool(SERVICE.llm.key)})
+                wecom_api_configured = WECOM_PROCESSOR.api.configured
+                callback_configured = wecom_callback_configured()
+                self.send_json({"status": "ok" if healthy else "degraded", "environment": ENVIRONMENT, "database": "ok" if database_ok else "error", "model_configured": bool(SERVICE.llm.key), "wecom_api_configured": wecom_api_configured, "wecom_callback_configured": callback_configured, "wecom_kf_configured": wecom_api_configured and callback_configured and bool(os.getenv("WECOM_KF_OPEN_ID", "").strip())})
                 return
+            if path == "/wecom/kf/callback":
+                if not wecom_callback_configured():
+                    self.send_response(503); self.end_headers(); return
+                query = parse_qs(urlparse(self.path).query)
+                signature = query.get("msg_signature", query.get("signature", [""]))[0]
+                timestamp = query.get("timestamp", [""])[0]
+                nonce = query.get("nonce", [""])[0]
+                try:
+                    plain = wecom_crypto_from_env().decrypt_echo(signature, timestamp, nonce, query.get("echostr", [""])[0])
+                except WeComProtocolError:
+                    self.send_response(403); self.end_headers(); return
+                except (TypeError, ValueError):
+                    self.send_response(503); self.end_headers(); return
+                self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.send_header("Content-Length", str(len(plain))); self.end_headers(); self.wfile.write(plain); return
             if path == "/wechat/callback":
                 query = parse_qs(urlparse(self.path).query)
                 token = os.getenv("WECHAT_CALLBACK_TOKEN", "")
@@ -393,6 +601,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if path == "/wecom/kf/callback":
+                if not wecom_callback_configured():
+                    self.send_response(503); self.end_headers(); return
+                query = parse_qs(urlparse(self.path).query)
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length < 0 or length > MAX_BODY_BYTES:
+                        raise ValueError("请求体过大")
+                    payload = self.rfile.read(length)
+                    crypto = wecom_crypto_from_env()
+                    event = crypto.decrypt_callback(payload, query.get("msg_signature", query.get("signature", [""]))[0], query.get("timestamp", [""])[0], query.get("nonce", [""])[0])
+                except WeComProtocolError:
+                    self.send_response(403); self.end_headers(); return
+                except (TypeError, ValueError, OSError):
+                    self.send_response(400); self.end_headers(); return
+                self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.send_header("Content-Length", str(len(b"success"))); self.end_headers(); self.wfile.write(b"success")
+                threading.Thread(target=_process_wecom_event, args=(event,), daemon=True, name="wecom-kf-sync").start()
+                return
             if path == "/wechat/callback":
                 query = parse_qs(urlparse(self.path).query)
                 token = os.getenv("WECHAT_CALLBACK_TOKEN", "")

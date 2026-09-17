@@ -3,7 +3,12 @@ import unittest
 import base64
 import hashlib
 import json
+import os
+import threading
+import urllib.request
 from pathlib import Path
+from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 import app
 from wechat_adapter import WeComAPI, WeComCrypto, WeComProtocolError, truncate_utf8
@@ -50,6 +55,7 @@ class CustomerServiceTests(unittest.TestCase):
         first = self.service.chat({"message": "你们几点营业？", "channel": "wechat_official_account", "external_customer_id": "wechat:test-openid"})
         second = self.service.chat({"message": "还有套餐吗？", "channel": "wechat_official_account", "external_customer_id": "wechat:test-openid"})
         self.assertEqual(first["customer_id"], second["customer_id"])
+        self.assertEqual(first["conversation_id"], second["conversation_id"])
         self.assertEqual(len(self.db.query("SELECT * FROM customers")), 1)
 
     def test_memory_is_candidate_until_approval(self):
@@ -156,6 +162,140 @@ class WeComProtocolTests(unittest.TestCase):
         value = truncate_utf8("美" * 1000)
         self.assertLessEqual(len(value.encode("utf-8")), 2048)
         self.assertTrue(value.endswith("美"))
+
+
+class FakeWeComAPI:
+    configured = True
+
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.sync_calls = []
+        self.send_calls = []
+
+    def sync_messages(self, callback_token, account_id, cursor):
+        self.sync_calls.append((callback_token, account_id, cursor))
+        return self.pages.pop(0)
+
+    def send_text(self, external_userid, account_id, answer, msgid=""):
+        self.send_calls.append((external_userid, account_id, answer, msgid))
+        return {"errcode": 0, "msgid": msgid}
+
+
+class StubCustomerService:
+    def __init__(self):
+        self.calls = []
+
+    def chat(self, body):
+        self.calls.append(body)
+        return {"answer": "可以，已为您登记预约意向。"}
+
+
+class WeComMessageProcessorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = app.StoreDB(Path(self.tmp.name) / "wecom.db")
+        self.service = StubCustomerService()
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def test_pagination_empty_page_and_msgid_deduplication(self):
+        item = {
+            "msgid": "incoming-1",
+            "open_kfid": "kf-id",
+            "external_userid": "external-1",
+            "origin": 3,
+            "msgtype": "text",
+            "text": {"content": "明天下午预约补水"},
+        }
+        api = FakeWeComAPI([
+            {"errcode": 0, "next_cursor": "cursor-1", "has_more": 1, "msg_list": []},
+            {"errcode": 0, "next_cursor": "cursor-2", "has_more": 0, "msg_list": [item, item]},
+        ])
+        processor = app.WeComMessageProcessor(self.db, self.service, api=api)
+        processor.sync("pull-token", "kf-id")
+        self.assertEqual(len(self.service.calls), 1)
+        self.assertEqual(len(api.send_calls), 1)
+        self.assertEqual(api.sync_calls[1][2], "cursor-1")
+        cursor = self.db.one("SELECT cursor FROM channel_cursors WHERE account_id='kf-id'")
+        self.assertEqual(cursor["cursor"], "cursor-2")
+        records = self.db.query("SELECT * FROM channel_messages ORDER BY direction")
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record["status"] in {"processed", "sent"} for record in records))
+
+    def test_non_text_message_gets_controlled_reply(self):
+        api = FakeWeComAPI([])
+        processor = app.WeComMessageProcessor(self.db, self.service, api=api)
+        processor._process_item({"msgid": "image-1", "external_userid": "external-1", "origin": 3, "msgtype": "image"}, "kf-id")
+        self.assertEqual(len(self.service.calls), 0)
+        self.assertIn("文字", api.send_calls[0][2])
+
+    def test_send_failure_event_updates_outbound_status(self):
+        api = FakeWeComAPI([])
+        processor = app.WeComMessageProcessor(self.db, self.service, api=api)
+        self.db.claim_channel_message(app.TENANT_DEFAULT, "wecom_kf", "failed-send-id", "outgoing", "external-1", "kf-id")
+        processor._process_item({
+            "msgid": "event-1",
+            "msgtype": "event",
+            "event": {"event_type": "msg_send_fail", "external_userid": "external-1", "fail_msgid": "failed-send-id", "fail_type": 4},
+        }, "kf-id")
+        sent = self.db.one("SELECT * FROM channel_messages WHERE external_msg_id='failed-send-id' AND direction='outgoing'")
+        self.assertEqual(sent["status"], "failed")
+        self.assertEqual(sent["error_code"], "4")
+
+
+class WeComCallbackHTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.aes_key = base64.b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+        self.env = patch.dict(os.environ, {
+            "WECOM_CORP_ID": "ww-corp-id",
+            "WECOM_CALLBACK_TOKEN": "callback-token",
+            "WECOM_CALLBACK_AES_KEY": self.aes_key,
+        })
+        self.env.start()
+        self.crypto = WeComCrypto("callback-token", self.aes_key, "ww-corp-id")
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.env.stop()
+
+    def test_get_echo_and_post_event_callbacks(self):
+        timestamp, nonce = "1700000000", "nonce"
+        echo = self.crypto.encrypt_for_test("echo-ok".encode(), b"0123456789abcdef")
+        signature = self.crypto.signature(timestamp, nonce, echo)
+        base = f"http://127.0.0.1:{self.server.server_port}/wecom/kf/callback"
+        query = urllib.parse.urlencode({"msg_signature": signature, "timestamp": timestamp, "nonce": nonce, "echostr": echo})
+        with urllib.request.urlopen(f"{base}?{query}", timeout=3) as response:
+            self.assertEqual(response.read(), b"echo-ok")
+
+        event_xml = b"<xml><Event><![CDATA[kf_msg_or_event]]></Event><Token><![CDATA[pull-token]]></Token><OpenKfId><![CDATA[kf-id]]></OpenKfId></xml>"
+        encrypted = self.crypto.encrypt_for_test(event_xml, b"fedcba9876543210")
+        signature = self.crypto.signature(timestamp, nonce, encrypted)
+        body = f"<xml><Encrypt><![CDATA[{encrypted}]]></Encrypt></xml>".encode()
+        received = []
+        handled = threading.Event()
+        original = app._process_wecom_event
+
+        def capture_event(event):
+            received.append(event)
+            handled.set()
+
+        app._process_wecom_event = capture_event
+        try:
+            query = urllib.parse.urlencode({"msg_signature": signature, "timestamp": timestamp, "nonce": nonce})
+            request = urllib.request.Request(f"{base}?{query}", data=body, headers={"Content-Type": "application/xml"})
+            with urllib.request.urlopen(request, timeout=3) as response:
+                self.assertEqual(response.read(), b"success")
+            self.assertTrue(handled.wait(2))
+            self.assertEqual(received[0]["OpenKfId"], "kf-id")
+        finally:
+            app._process_wecom_event = original
 
 
 if __name__ == "__main__":

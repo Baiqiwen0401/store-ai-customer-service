@@ -18,6 +18,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as directory:
         db = app.StoreDB(Path(directory) / "eval.sqlite3")
         service = app.CustomerService(db)
+        # The regression set asserts deterministic routing and must not depend
+        # on whichever model credentials happen to be present on a developer PC.
+        service.llm.key = None
+        service.llm.dify.base_url = ""
+        service.llm.dify.api_key = ""
         for case in cases:
             result = service.chat({"message": case["message"]})
             mode_ok = result["reply_mode"] == case["mode"]
