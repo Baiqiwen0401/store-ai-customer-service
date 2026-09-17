@@ -90,11 +90,13 @@ CREATE TABLE IF NOT EXISTS model_events (event_id INTEGER PRIMARY KEY AUTOINCREM
 CREATE TABLE IF NOT EXISTS audit_log (audit_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER, detail_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS channel_cursors (cursor_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, channel TEXT NOT NULL, account_id TEXT NOT NULL, cursor TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, UNIQUE(tenant_id, channel, account_id));
 CREATE TABLE IF NOT EXISTS channel_messages (channel_message_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, channel TEXT NOT NULL, external_msg_id TEXT NOT NULL, direction TEXT NOT NULL, external_customer_id TEXT, account_id TEXT NOT NULL, status TEXT NOT NULL, error_code TEXT, error_message TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(tenant_id, channel, external_msg_id, direction));
+CREATE TABLE IF NOT EXISTS notification_outbox (notification_id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, channel TEXT NOT NULL, dedupe_key TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(tenant_id, channel, dedupe_key));
 CREATE INDEX IF NOT EXISTS idx_knowledge_tenant ON knowledge(tenant_id, status, intent);
 CREATE INDEX IF NOT EXISTS idx_memory_customer ON memories(tenant_id, customer_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_channel_messages_status ON channel_messages(tenant_id, channel, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_notification_outbox_due ON notification_outbox(status, next_attempt_at);
 """
 
 class StoreDB:
@@ -155,6 +157,9 @@ class StoreDB:
         rows = self.query(sql, args); return rows[0] if rows else None
     def execute(self, sql: str, args=()):
         with self.lock, self.conn: return self.conn.execute(sql, args).lastrowid
+    def execute_count(self, sql: str, args=()):
+        with self.lock, self.conn:
+            return self.conn.execute(sql, args).rowcount
     def claim_channel_message(self, tenant_id, channel, external_msg_id, direction, external_customer_id, account_id):
         ts = now()
         with self.lock, self.conn:
@@ -209,7 +214,7 @@ class CustomerService:
     BUDGET_RE = re.compile(r"预算[^0-9]{0,5}(\d{2,5})\s*元?"); TIME_RE = re.compile(r"(周[一二三四五六日天](?:上午|下午|晚上)?|上午|下午|晚上)")
     INTENT_RULES = {"packages": ("套餐", "套卡", "组合项目", "优惠套餐", "会员卡"), "promotion": ("优惠", "活动", "团购", "赠送", "折扣"), "price": ("多少钱", "价格", "收费", "费用", "价目", "怎么收费"), "services": ("有哪些项目", "有什么项目", "门店项目", "服务项目", "哪些服务", "有什么服务", "服务有哪些", "有什么护理", "哪些护理", "做什么项目", "做什么护理"), "address": ("地址", "怎么去", "在哪里", "位置", "电话", "联系"), "hours": ("营业时间", "营业吗", "营业", "几点开", "几点关", "开门", "下班"), "duration": ("多久", "多长时间", "几分钟", "时长"), "first_visit": ("第一次", "首次到店", "第一次来", "初次"), "suitability": ("适合我吗", "适不适合", "能不能做", "可以做吗"), "cancellation": ("改期", "取消预约", "改预约", "迟到"), "appointment": ("预约", "预定", "有时间", "有空", "安排"), "precautions": ("注意事项", "注意什么", "禁忌", "术后", "护理建议"), "preparation": ("护理前", "做之前", "之前要准备", "护理前准备"), "aftercare": ("护理后", "做完之后", "做完注意", "术后护理"), "results": ("有效果吗", "效果怎么样", "多久见效", "能改善吗"), "payment": ("怎么付款", "付款方式", "支持什么支付", "发票"), "privacy": ("隐私", "手机号", "个人信息", "删除信息")}
     CLINICAL_NOTICE = "\n\nAI回复不作为治疗依据，建议转人工评估。"
-    def __init__(self, db): self.db = db; self.llm = LLMClient(db)
+    def __init__(self, db, notification_outbox=None): self.db = db; self.llm = LLMClient(db); self.notification_outbox = notification_outbox
     @classmethod
     def classify_intent(cls, message):
         for intent, phrases in cls.INTENT_RULES.items():
@@ -316,8 +321,82 @@ class CustomerService:
                 task_created = True
         if task_created and task_type == "appointment_lead":
             summary = f"待办编号：{task_id}\n客户问题：{message[:240]}\n会话编号：{conversation_id}"
-            threading.Thread(target=WeComGroupNotifier.from_env().send_appointment, args=(summary,), daemon=True).start()
+            if self.notification_outbox:
+                self.notification_outbox.enqueue_appointment(tenant_id, task_id, summary)
+            else:
+                threading.Thread(target=WeComGroupNotifier.from_env().send_appointment, args=(summary,), daemon=True).start()
         return {"conversation_id": conversation_id, "customer_id": cid, "answer": answer, "confidence": confidence, "handoff": handoff, "handoff_reason": reason, "task_id": task_id, "intent": intent, "reply_mode": mode, "model_status": self.llm.last_status}
+
+
+class NotificationOutbox:
+    """Durable, idempotent delivery for internal appointment notifications."""
+
+    retry_delays = (60, 300, 900, 3600, 10800)
+
+    def __init__(self, db, notifier=None):
+        self.db = db
+        self.notifier = notifier or WeComGroupNotifier.from_env()
+        self.wakeup = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def enqueue_appointment(self, tenant_id, task_id, summary):
+        ts = now()
+        self.db.execute(
+            "INSERT OR IGNORE INTO notification_outbox(tenant_id,channel,dedupe_key,payload,status,attempt_count,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (tenant_id, "wecom_group", f"appointment:{task_id}", summary, "pending", 0, ts, ts, ts),
+        )
+        self.wakeup.set()
+
+    def deliver_due(self, limit=20):
+        due = self.db.query(
+            "SELECT * FROM notification_outbox WHERE status IN ('pending','failed') AND next_attempt_at<=? ORDER BY notification_id LIMIT ?",
+            (now(), int(limit)),
+        )
+        delivered = 0
+        for row in due:
+            notification_id = row["notification_id"]
+            attempt = int(row["attempt_count"]) + 1
+            claimed = self.db.execute_count(
+                "UPDATE notification_outbox SET status='sending',attempt_count=?,updated_at=? WHERE notification_id=? AND status IN ('pending','failed') AND next_attempt_at<=?",
+                (attempt, now(), notification_id, now()),
+            )
+            if claimed != 1:
+                continue
+            try:
+                ok = self.notifier.send_appointment(row["payload"])
+            except Exception:
+                LOGGER.exception("appointment notification raised unexpectedly")
+                ok = False
+            if ok:
+                self.db.execute("UPDATE notification_outbox SET status='sent',last_error=NULL,updated_at=? WHERE notification_id=?", (now(), notification_id))
+                delivered += 1
+            else:
+                delay = self.retry_delays[min(attempt - 1, len(self.retry_delays) - 1)]
+                next_attempt = datetime.fromtimestamp(time.time() + delay, timezone.utc).isoformat(timespec="seconds")
+                self.db.execute("UPDATE notification_outbox SET status='failed',last_error=?,next_attempt_at=?,updated_at=? WHERE notification_id=?", ("群机器人通知失败或未配置", next_attempt, now(), notification_id))
+        return delivered
+
+    def _run(self):
+        # A process may have stopped between claiming and sending. Make those
+        # rows retryable on startup; the unique dedupe key prevents duplicates.
+        self.db.execute("UPDATE notification_outbox SET status='failed',next_attempt_at=?,updated_at=? WHERE status='sending'", (now(), now()))
+        while not self.stop_event.is_set():
+            self.deliver_due()
+            self.wakeup.wait(30)
+            self.wakeup.clear()
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True, name="notification-outbox")
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.wakeup.set()
+        if self.thread:
+            self.thread.join(timeout=3)
 
 
 class WeComMessageProcessor:
@@ -450,7 +529,9 @@ class WeComMessageProcessor:
         account_id = str(event.get("OpenKfId") or os.getenv("WECOM_KF_OPEN_ID", "")).strip()
         self.sync(str(event.get("Token") or ""), account_id)
 
-DB = StoreDB(); SERVICE = CustomerService(DB)
+DB = StoreDB()
+NOTIFICATION_OUTBOX = NotificationOutbox(DB)
+SERVICE = CustomerService(DB, NOTIFICATION_OUTBOX)
 WECOM_PROCESSOR = WeComMessageProcessor(DB, SERVICE)
 
 
@@ -568,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
             protected_get = (
                 path == "/api/model-status"
-                or path in {"/api/customers", "/api/tasks", "/api/conversations", "/api/memories", "/api/knowledge", "/api/audit"}
+                or path in {"/api/customers", "/api/tasks", "/api/notifications", "/api/conversations", "/api/memories", "/api/knowledge", "/api/audit"}
                 or bool(re.fullmatch(r"/api/conversations/\d+", path))
             )
             if protected_get and not self.staff_ok():
@@ -580,6 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                 last = DB.one("SELECT * FROM model_events WHERE tenant_id=? ORDER BY event_id DESC LIMIT 1", (tenant,)); self.send_json({**SERVICE.llm.last_status, "last_event": row_dict(last)}); return
             if path == "/api/customers": self.send_json([dict(r) for r in DB.query("SELECT * FROM customers WHERE tenant_id=? ORDER BY updated_at DESC", (tenant,))]); return
             if path == "/api/tasks": self.send_json([dict(r) for r in DB.query("SELECT * FROM tasks WHERE tenant_id=? ORDER BY updated_at DESC", (tenant,))]); return
+            if path == "/api/notifications": self.send_json([dict(r) for r in DB.query("SELECT * FROM notification_outbox WHERE tenant_id=? ORDER BY notification_id DESC LIMIT 200", (tenant,))]); return
             if path == "/api/conversations": self.send_json([dict(r) for r in DB.query("SELECT c.*,cu.name,cu.phone,(SELECT content FROM messages WHERE conversation_id=c.conversation_id ORDER BY message_id DESC LIMIT 1) AS last_message FROM conversations c LEFT JOIN customers cu ON cu.customer_id=c.customer_id WHERE c.tenant_id=? ORDER BY c.updated_at DESC", (tenant,))]); return
             match = re.fullmatch(r"/api/conversations/(\d+)", path)
             if match:
@@ -686,6 +768,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(payload, 500)
 
 def main():
-    print(f"AI 客服 running at http://{HOST}:{PORT}"); ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    NOTIFICATION_OUTBOX.start()
+    print(f"AI 客服 running at http://{HOST}:{PORT}")
+    try:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    finally:
+        NOTIFICATION_OUTBOX.stop()
 
 if __name__ == "__main__": main()

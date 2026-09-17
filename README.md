@@ -44,6 +44,7 @@ docker compose up --build
 - `GET /api/model-status`：最近模型调用状态、耗时和错误类别，不返回密钥。
 - `GET /api/health`：服务和数据库健康检查，供反向代理和监控使用。
 - `GET /api/tasks`、`POST /api/tasks/{id}/complete`：预约/人工待办。
+- `GET /api/notifications`：预约群通知发送、失败和重试状态。
 - `GET /api/memories`、`POST /api/memories/{id}/approve|reject`：长期记忆审核。
 - `GET /api/knowledge`、`POST /api/knowledge`、`PUT /api/knowledge/{id}/publish|archive`：知识草稿和发布。
 

@@ -190,6 +190,16 @@ class StubCustomerService:
         return {"answer": "可以，已为您登记预约意向。"}
 
 
+class StubNotifier:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def send_appointment(self, summary):
+        self.calls.append(summary)
+        return self.outcomes.pop(0)
+
+
 class WeComMessageProcessorTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -296,6 +306,43 @@ class WeComCallbackHTTPTests(unittest.TestCase):
             self.assertEqual(received[0]["OpenKfId"], "kf-id")
         finally:
             app._process_wecom_event = original
+
+
+class NotificationOutboxTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = app.StoreDB(Path(self.tmp.name) / "outbox.db")
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def test_appointment_notification_is_deduplicated_and_retried(self):
+        notifier = StubNotifier([False, True])
+        outbox = app.NotificationOutbox(self.db, notifier)
+        outbox.enqueue_appointment(app.TENANT_DEFAULT, 42, "预约摘要")
+        outbox.enqueue_appointment(app.TENANT_DEFAULT, 42, "预约摘要")
+        self.assertEqual(len(self.db.query("SELECT * FROM notification_outbox")), 1)
+        self.assertEqual(outbox.deliver_due(), 0)
+        failed = self.db.one("SELECT * FROM notification_outbox")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["attempt_count"], 1)
+        self.db.execute("UPDATE notification_outbox SET next_attempt_at=?", (app.now(),))
+        self.assertEqual(outbox.deliver_due(), 1)
+        sent = self.db.one("SELECT * FROM notification_outbox")
+        self.assertEqual(sent["status"], "sent")
+        self.assertEqual(sent["attempt_count"], 2)
+        self.assertEqual(len(notifier.calls), 2)
+
+    def test_customer_service_enqueues_one_notification_per_appointment_task(self):
+        notifier = StubNotifier([True])
+        outbox = app.NotificationOutbox(self.db, notifier)
+        service = app.CustomerService(self.db, outbox)
+        first = service.chat({"message": "周六下午可以预约吗？", "channel": "wecom_kf", "external_customer_id": "wecom_kf:test"})
+        service.chat({"message": "我想预约补水", "channel": "wecom_kf", "external_customer_id": "wecom_kf:test"})
+        rows = self.db.query("SELECT * FROM notification_outbox")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["dedupe_key"], f"appointment:{first['task_id']}")
 
 
 if __name__ == "__main__":
