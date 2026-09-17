@@ -1,9 +1,26 @@
 import tempfile
 import unittest
+import base64
+import hashlib
+import json
 from pathlib import Path
 
 import app
-from wechat_adapter import parse_message, verify_signature
+from wechat_adapter import WeComAPI, WeComCrypto, WeComProtocolError, truncate_utf8
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class CustomerServiceTests(unittest.TestCase):
@@ -34,14 +51,6 @@ class CustomerServiceTests(unittest.TestCase):
         second = self.service.chat({"message": "还有套餐吗？", "channel": "wechat_official_account", "external_customer_id": "wechat:test-openid"})
         self.assertEqual(first["customer_id"], second["customer_id"])
         self.assertEqual(len(self.db.query("SELECT * FROM customers")), 1)
-
-    def test_wechat_signature_and_text_xml(self):
-        import hashlib
-        token, timestamp, nonce = "token", "1700000000", "nonce"
-        signature = hashlib.sha1("".join(sorted((token, timestamp, nonce))).encode()).hexdigest()
-        self.assertTrue(verify_signature(token, signature, timestamp, nonce))
-        payload = "<xml><ToUserName><![CDATA[gh_store]]></ToUserName><FromUserName><![CDATA[openid]]></FromUserName><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[有套餐吗？]]></Content><MsgId>1</MsgId></xml>".encode()
-        self.assertEqual(parse_message(payload)["from_user"], "openid")
 
     def test_memory_is_candidate_until_approval(self):
         result = self.service.chat({"message": "我是敏感肌，周六下午想做补水，预算 300 元", "memory_consent": True})
@@ -93,6 +102,60 @@ class CustomerServiceTests(unittest.TestCase):
         self.assertIsNone(result["task_id"])
         self.assertIn("项目组合", result["answer"])
         self.assertNotIn("优惠、团购", result["answer"])
+
+
+class WeComProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.aes_key = base64.b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+        self.crypto = WeComCrypto("callback-token", self.aes_key, "ww-corp-id")
+
+    def test_callback_signature_and_aes_round_trip(self):
+        event = b"<xml><Event><![CDATA[kf_msg_or_event]]></Event><Token><![CDATA[pull-token]]></Token><OpenKfId><![CDATA[kf-id]]></OpenKfId></xml>"
+        encrypted = self.crypto.encrypt_for_test(event, b"0123456789abcdef")
+        signature = self.crypto.signature("1700000000", "nonce", encrypted)
+        envelope = f"<xml><Encrypt><![CDATA[{encrypted}]]></Encrypt></xml>".encode()
+        parsed = self.crypto.decrypt_callback(envelope, signature, "1700000000", "nonce")
+        self.assertEqual(parsed["Event"], "kf_msg_or_event")
+        self.assertEqual(parsed["Token"], "pull-token")
+        self.assertEqual(parsed["OpenKfId"], "kf-id")
+
+    def test_invalid_signature_and_corp_id_are_rejected(self):
+        encrypted = self.crypto.encrypt_for_test(b"echo", b"0123456789abcdef")
+        with self.assertRaises(WeComProtocolError):
+            self.crypto.decrypt_echo("invalid", "1", "2", encrypted)
+        other = WeComCrypto("callback-token", self.aes_key, "different-corp")
+        with self.assertRaises(WeComProtocolError):
+            other.decrypt(encrypted)
+
+    def test_access_token_is_cached_and_api_bodies_match_contract(self):
+        calls = []
+        responses = [
+            {"errcode": 0, "access_token": "secret-access-token", "expires_in": 7200},
+            {"errcode": 0, "next_cursor": "next", "has_more": 0, "msg_list": []},
+            {"errcode": 0, "msgid": "sent-id"},
+        ]
+
+        def fake_urlopen(request, timeout):
+            calls.append(request)
+            return FakeResponse(responses.pop(0))
+
+        api = WeComAPI("corp", "secret", base_url="https://wecom.invalid", urlopen=fake_urlopen)
+        sync_result = api.sync_messages("pull-token", "kf-id")
+        send_result = api.send_text("external-user", "kf-id", "您好")
+        self.assertEqual(sync_result["next_cursor"], "next")
+        self.assertEqual(send_result["msgid"], "sent-id")
+        self.assertEqual(sum("gettoken" in request.full_url for request in calls), 1)
+        sync_body = json.loads(calls[1].data)
+        send_body = json.loads(calls[2].data)
+        self.assertEqual(sync_body["token"], "pull-token")
+        self.assertEqual(sync_body["open_kfid"], "kf-id")
+        self.assertEqual(send_body["touser"], "external-user")
+        self.assertEqual(send_body["text"]["content"], "您好")
+
+    def test_utf8_reply_limit_does_not_split_characters(self):
+        value = truncate_utf8("美" * 1000)
+        self.assertLessEqual(len(value.encode("utf-8")), 2048)
+        self.assertTrue(value.endswith("美"))
 
 
 if __name__ == "__main__":
