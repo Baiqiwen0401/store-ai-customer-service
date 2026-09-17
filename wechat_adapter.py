@@ -65,6 +65,14 @@ class WeComCrypto:
         self.token = token
         self.receive_id = receive_id
 
+    @classmethod
+    def from_env(cls) -> "WeComCrypto":
+        return cls(
+            os.getenv("WECOM_CALLBACK_TOKEN", "").strip(),
+            os.getenv("WECOM_CALLBACK_AES_KEY", "").strip(),
+            os.getenv("WECOM_CORP_ID", "").strip(),
+        )
+
     def signature(self, timestamp: str, nonce: str, encrypted: str) -> str:
         parts = (self.token, str(timestamp), str(nonce), encrypted)
         return hashlib.sha1("".join(sorted(parts)).encode("utf-8")).hexdigest()
@@ -272,13 +280,15 @@ class WeComAPI:
             body["cursor"] = cursor
         return self._post("/cgi-bin/kf/sync_msg", body)
 
-    def send_text(self, external_userid: str, open_kfid: str, content: str) -> dict[str, Any]:
+    def send_text(self, external_userid: str, open_kfid: str, content: str, msgid: str = "") -> dict[str, Any]:
         body = {
             "touser": external_userid,
             "open_kfid": open_kfid,
             "msgtype": "text",
             "text": {"content": truncate_utf8(content or "已收到您的消息。")},
         }
+        if msgid:
+            body["msgid"] = msgid
         return self._post("/cgi-bin/kf/send_msg", body)
 
 
